@@ -1,0 +1,14 @@
+services:
+  wazuh.dashboard:
+    volumes:
+      - "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml:rw"
+    networks:
+      default:
+      proxy:
+        aliases:
+          - wazuh-dashboard
+
+networks:
+  proxy:
+    external: true
+    name: "{{ docker_proxy_network }}"

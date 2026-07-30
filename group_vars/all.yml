@@ -1,0 +1,62 @@
+---
+timezone: Europe/Warsaw
+
+# Zatrzymuje lokalne usługi nginx/apache2, jeżeli zajmują porty 80/443.
+disable_conflicting_web_services: true
+
+docker_proxy_network: proxy
+
+# Katalogi wdrożenia
+npm_directory: /opt/nginx-proxy-manager
+gateway_directory: /opt/path-gateway
+wazuh_directory: /opt/wazuh
+wazuh_persistent_directory: /opt/wazuh-persistent
+socfortress_directory: /opt/wazuh-socfortress
+zabbix_directory: /opt/zabbix
+
+# Nginx Proxy Manager
+npm_app_image: jc21/nginx-proxy-manager:latest
+npm_database_image: mariadb:11.4
+npm_database_name: npm
+npm_database_user: npm
+npm_database_password: "CHANGE_ME_NPM_DB_PASSWORD"
+npm_database_root_password: "CHANGE_ME_NPM_ROOT_PASSWORD"
+
+# Brama ścieżkowa
+gateway_nginx_image: nginx:stable-alpine
+gateway_default_path: /wazuh/
+
+# Wazuh
+wazuh_docker_repository: https://github.com/wazuh/wazuh-docker.git
+wazuh_docker_version: v4.14.6
+wazuh_dashboard_local_port: 8443
+wazuh_dashboard_uid: 1000
+wazuh_dashboard_gid: 1000
+
+# SOCFortress
+socfortress_rules_enabled: true
+socfortress_repository: https://github.com/socfortress/Wazuh-Rules.git
+socfortress_repository_version: main
+
+# Własne detekcje
+custom_wazuh_rules_source: "{{ playbook_dir }}/files/wazuh/custom_rules"
+custom_wazuh_decoders_source: "{{ playbook_dir }}/files/wazuh/custom_decoders"
+
+# Zabbix 7.0 LTS
+zabbix_server_image: zabbix/zabbix-server-mysql:alpine-7.0-latest
+zabbix_web_base_image: zabbix/zabbix-web-nginx-mysql:alpine-7.0-latest
+zabbix_database_image: mysql:8.0-oracle
+zabbix_database_name: zabbix
+zabbix_database_user: zabbix
+zabbix_database_password: "CHANGE_ME_ZABBIX_DB_PASSWORD"
+zabbix_database_root_password: "CHANGE_ME_ZABBIX_ROOT_PASSWORD"
+zabbix_server_name: "Zabbix Security Monitoring"
+
+# Zabbix Agent 2 na hoście
+zabbix_agent2_enabled: true
+zabbix_agent_server_address: "127.0.0.1"
+zabbix_agent_allowed_servers: "127.0.0.1,172.16.0.0/12"
+zabbix_agent_hostname: ""
+zabbix_agent_listen_port: 10050
+zabbix_agent_monitor_docker: true
+zabbix_agent_host_metadata: "linux,docker,ansible"

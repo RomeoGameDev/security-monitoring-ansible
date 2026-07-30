@@ -1,0 +1,934 @@
+---
+- name: Deploy Wazuh, SOCFortress, Zabbix and reverse proxy
+  hosts: docker_servers
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify supported operating system
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              ansible_facts["distribution"] == "Ubuntu"
+              and ansible_facts["distribution_version"] is version("24.04", ">=")
+            )
+            or
+            (
+              ansible_facts["distribution"] == "Debian"
+              and ansible_facts["distribution_major_version"] | int >= 13
+            )
+        fail_msg: >-
+          Obsługiwane systemy to Ubuntu 24.04+ oraz Debian 13+.
+          Wykryto {{ ansible_facts["distribution"] }}
+          {{ ansible_facts["distribution_version"] }}.
+
+    - name: Set deployment facts
+      ansible.builtin.set_fact:
+        deployment_ip: "{{ ansible_facts['default_ipv4']['address'] }}"
+        docker_repository_os: "{{ ansible_facts['distribution'] | lower }}"
+        docker_repository_arch: >-
+          {{
+            {
+              'x86_64': 'amd64',
+              'aarch64': 'arm64',
+              'armv7l': 'armhf'
+            }.get(ansible_facts['architecture'], ansible_facts['architecture'])
+          }}
+        zabbix_repository_os: "{{ ansible_facts['distribution'] | lower }}"
+        zabbix_repository_version: >-
+          {{
+            ansible_facts['distribution_version']
+            if ansible_facts['distribution'] == 'Ubuntu'
+            else ansible_facts['distribution_major_version']
+          }}
+
+    - name: Build Zabbix repository package URL
+      ansible.builtin.set_fact:
+        zabbix_repository_package_url: >-
+          https://repo.zabbix.com/zabbix/7.0/{{ zabbix_repository_os }}/pool/main/z/zabbix-release/zabbix-release_latest_7.0+{{ zabbix_repository_os }}{{ zabbix_repository_version }}_all.deb
+
+    - name: Show deployment target
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "IP: {{ deployment_ip }}"
+          - "System: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+          - "Wazuh: http://{{ deployment_ip }}/wazuh/"
+          - "Zabbix: http://{{ deployment_ip }}/zabbix/"
+
+  tasks:
+    ####################################################################
+    # HOST
+    ####################################################################
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - git
+          - gnupg
+          - python3
+          - python3-requests
+          - python3-debian
+          - rsync
+          - unzip
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Read service facts
+      ansible.builtin.service_facts:
+
+    - name: Stop conflicting host web services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - nginx.service
+        - apache2.service
+      when:
+        - disable_conflicting_web_services | bool
+        - item in ansible_facts.services
+
+    ####################################################################
+    # DOCKER
+    ####################################################################
+
+    - name: Remove conflicting Docker packages
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose
+          - docker-compose-v2
+          - docker-doc
+          - podman-docker
+          - containerd
+          - runc
+        state: absent
+
+    - name: Create APT keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Remove legacy Docker repository file
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/docker.list
+        state: absent
+
+    - name: Download Docker repository signing key
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ docker_repository_os }}/gpg"
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+
+    - name: Configure Docker repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types:
+          - deb
+        uris:
+          - "https://download.docker.com/linux/{{ docker_repository_os }}"
+        suites:
+          - "{{ ansible_facts['distribution_release'] }}"
+        components:
+          - stable
+        architectures:
+          - "{{ docker_repository_arch }}"
+        signed_by: /etc/apt/keyrings/docker.asc
+        state: present
+      register: docker_repository
+
+    - name: Install Docker Engine and Compose
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Enable Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add deployment user to Docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups:
+          - docker
+        append: true
+
+    - name: Configure vm.max_map_count
+      ansible.posix.sysctl:
+        name: vm.max_map_count
+        value: "262144"
+        sysctl_set: true
+        state: present
+        reload: true
+
+    - name: Create shared proxy network
+      community.docker.docker_network:
+        name: "{{ docker_proxy_network }}"
+        state: present
+
+    ####################################################################
+    # NGINX PROXY MANAGER
+    ####################################################################
+
+    - name: Create Nginx Proxy Manager directory
+      ansible.builtin.file:
+        path: "{{ npm_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Create Nginx Proxy Manager environment
+      ansible.builtin.template:
+        src: npm.env.j2
+        dest: "{{ npm_directory }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Create Nginx Proxy Manager Compose file
+      ansible.builtin.template:
+        src: npm-compose.yml.j2
+        dest: "{{ npm_directory }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Validate Nginx Proxy Manager Compose file
+      ansible.builtin.command:
+        cmd: docker compose config --quiet
+        chdir: "{{ npm_directory }}"
+      changed_when: false
+
+    - name: Start Nginx Proxy Manager
+      community.docker.docker_compose_v2:
+        project_src: "{{ npm_directory }}"
+        state: present
+        pull: always
+        remove_orphans: true
+        wait: true
+        wait_timeout: 240
+
+    ####################################################################
+    # WAZUH
+    ####################################################################
+
+    - name: Clone Wazuh Docker repository
+      ansible.builtin.git:
+        repo: "{{ wazuh_docker_repository }}"
+        dest: "{{ wazuh_directory }}"
+        version: "{{ wazuh_docker_version }}"
+        depth: 1
+        force: true
+        update: true
+
+    - name: Create persistent Wazuh Dashboard directory
+      ansible.builtin.file:
+        path: "{{ wazuh_persistent_directory }}/dashboard"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Check persistent Wazuh Dashboard application configuration
+      ansible.builtin.stat:
+        path: "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml"
+      register: persistent_wazuh_dashboard_config
+
+    - name: Seed persistent Wazuh Dashboard application configuration
+      ansible.builtin.copy:
+        src: "{{ wazuh_directory }}/single-node/config/wazuh_dashboard/wazuh.yml"
+        dest: "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml"
+        remote_src: true
+        owner: "{{ wazuh_dashboard_uid }}"
+        group: "{{ wazuh_dashboard_gid }}"
+        mode: "0660"
+      when: not persistent_wazuh_dashboard_config.stat.exists
+
+    - name: Set persistent Wazuh Dashboard configuration permissions
+      ansible.builtin.file:
+        path: "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml"
+        state: file
+        owner: "{{ wazuh_dashboard_uid }}"
+        group: "{{ wazuh_dashboard_gid }}"
+        mode: "0660"
+
+    - name: Configure Wazuh Dashboard base path
+      ansible.builtin.lineinfile:
+        path: "{{ wazuh_directory }}/single-node/config/wazuh_dashboard/opensearch_dashboards.yml"
+        regexp: "^{{ item.key | regex_escape }}:"
+        line: "{{ item.key }}: {{ item.value }}"
+        insertafter: EOF
+      loop:
+        - key: server.basePath
+          value: '"/wazuh"'
+        - key: server.rewriteBasePath
+          value: "true"
+        - key: server.ssl.enabled
+          value: "false"
+        - key: opensearch_security.cookie.secure
+          value: "false"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Bind Wazuh Dashboard diagnostics port to localhost
+      ansible.builtin.lineinfile:
+        path: "{{ wazuh_directory }}/single-node/docker-compose.yml"
+        regexp: '^\s*-\s*443:5601\s*$'
+        line: '      - "127.0.0.1:{{ wazuh_dashboard_local_port }}:5601"'
+
+    - name: Bind Wazuh Indexer port to localhost
+      ansible.builtin.lineinfile:
+        path: "{{ wazuh_directory }}/single-node/docker-compose.yml"
+        regexp: '^\s*-\s*"9200:9200"\s*$'
+        line: '      - "127.0.0.1:9200:9200"'
+
+    - name: Create Wazuh proxy override
+      ansible.builtin.template:
+        src: wazuh-proxy-compose.yml.j2
+        dest: "{{ wazuh_directory }}/single-node/docker-compose.proxy.yml"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Validate Wazuh Compose configuration
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          config --quiet
+        chdir: "{{ wazuh_directory }}/single-node"
+      changed_when: false
+
+    - name: Check Wazuh certificates
+      ansible.builtin.stat:
+        path: "{{ wazuh_directory }}/single-node/config/wazuh_indexer_ssl_certs/root-ca.pem"
+      register: wazuh_root_ca
+
+    - name: Generate Wazuh certificates
+      ansible.builtin.command:
+        cmd: docker compose -f generate-indexer-certs.yml run --rm generator
+        chdir: "{{ wazuh_directory }}/single-node"
+      when: not wazuh_root_ca.stat.exists
+      changed_when: true
+
+    - name: Start Wazuh
+      community.docker.docker_compose_v2:
+        project_src: "{{ wazuh_directory }}/single-node"
+        files:
+          - docker-compose.yml
+          - docker-compose.proxy.yml
+        state: present
+        pull: always
+        remove_orphans: true
+        wait: false
+
+    - name: Wait for Wazuh manager and dashboard containers
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          ps --status running --services
+        chdir: "{{ wazuh_directory }}/single-node"
+      register: wazuh_running_services
+      retries: 60
+      delay: 5
+      until:
+        - "'wazuh.manager' in wazuh_running_services.stdout_lines"
+        - "'wazuh.dashboard' in wazuh_running_services.stdout_lines"
+      changed_when: false
+
+    - name: Verify Wazuh Dashboard application configuration is writable
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          exec -T
+          -u {{ wazuh_dashboard_uid }}:{{ wazuh_dashboard_gid }}
+          wazuh.dashboard
+          test -w /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
+        chdir: "{{ wazuh_directory }}/single-node"
+      changed_when: false
+
+    ####################################################################
+    # SOCFORTRESS
+    ####################################################################
+
+    - name: Create SOCFortress directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ socfortress_directory }}"
+        - "{{ socfortress_directory }}/repository"
+        - "{{ socfortress_directory }}/rules"
+        - "{{ socfortress_directory }}/decoders"
+      when: socfortress_rules_enabled | bool
+
+    - name: Clone SOCFortress repository
+      ansible.builtin.git:
+        repo: "{{ socfortress_repository }}"
+        dest: "{{ socfortress_directory }}/repository"
+        version: "{{ socfortress_repository_version }}"
+        force: true
+        update: true
+      when: socfortress_rules_enabled | bool
+
+    - name: Check duplicate SOCFortress XML filenames
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          find "{{ socfortress_directory }}/repository" -type f -name '*.xml' -printf '%f\n' \
+            | sort | uniq -d
+        executable: /bin/bash
+      register: socfortress_duplicate_files
+      changed_when: false
+      failed_when: socfortress_duplicate_files.stdout | length > 0
+      when: socfortress_rules_enabled | bool
+
+    - name: Prepare SOCFortress rules and decoders
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+
+          repo="{{ socfortress_directory }}/repository"
+          rules="{{ socfortress_directory }}/rules"
+          decoders="{{ socfortress_directory }}/decoders"
+
+          rm -f "$rules"/*.xml "$decoders"/*.xml
+
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+
+            case "$name" in
+              decoder-linux-sysmon.xml|yara_decoders.xml|auditd_decoders.xml|naxsi-opnsense_decoders.xml|maltrail_decoders.xml|decoder-manager-logs.xml)
+                install -m 0644 "$file" "$decoders/$name"
+                ;;
+              *)
+                install -m 0644 "$file" "$rules/$name"
+                ;;
+            esac
+          done < <(find "$repo" -type f -name '*.xml' -print0)
+
+          sed -i \
+            's#<if_sid>100535</if_sid>#<if_sid>100534</if_sid>#' \
+            "$rules/100535-win_powershell_rules.xml"
+
+          sed -i \
+            's/sysmon_event_7/sysmon_event7/g' \
+            "$rules/900000-exclusion_rules.xml"
+
+          find "$rules" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
+            > "{{ socfortress_directory }}/socfortress-rules.manifest"
+
+          find "$decoders" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
+            > "{{ socfortress_directory }}/socfortress-decoders.manifest"
+        executable: /bin/bash
+      changed_when: true
+      when: socfortress_rules_enabled | bool
+
+    - name: Synchronize SOCFortress rules
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          container="single-node-wazuh.manager-1"
+          manifest="/var/ossec/etc/.socfortress-rules.manifest"
+
+          docker exec "$container" sh -c '
+            manifest="$1"
+            if [ -f "$manifest" ]; then
+              while IFS= read -r name; do
+                [ -n "$name" ] && rm -f "/var/ossec/etc/rules/$name"
+              done < "$manifest"
+            fi
+          ' sh "$manifest"
+
+          docker cp "{{ socfortress_directory }}/rules/." \
+            "$container:/var/ossec/etc/rules/"
+
+          docker cp "{{ socfortress_directory }}/socfortress-rules.manifest" \
+            "$container:$manifest"
+        executable: /bin/bash
+      changed_when: true
+      when: socfortress_rules_enabled | bool
+
+    - name: Synchronize SOCFortress decoders
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          container="single-node-wazuh.manager-1"
+          manifest="/var/ossec/etc/.socfortress-decoders.manifest"
+
+          docker exec "$container" sh -c '
+            manifest="$1"
+            if [ -f "$manifest" ]; then
+              while IFS= read -r name; do
+                [ -n "$name" ] && rm -f "/var/ossec/etc/decoders/$name"
+              done < "$manifest"
+            fi
+          ' sh "$manifest"
+
+          docker cp "{{ socfortress_directory }}/decoders/." \
+            "$container:/var/ossec/etc/decoders/"
+
+          docker cp "{{ socfortress_directory }}/socfortress-decoders.manifest" \
+            "$container:$manifest"
+        executable: /bin/bash
+      changed_when: true
+      when: socfortress_rules_enabled | bool
+
+    ####################################################################
+    # CUSTOM WAZUH RULES AND DECODERS
+    ####################################################################
+
+    - name: Ensure custom Wazuh source directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+      loop:
+        - "{{ custom_wazuh_rules_source }}"
+        - "{{ custom_wazuh_decoders_source }}"
+
+    - name: Build custom Wazuh manifests
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          find "{{ custom_wazuh_rules_source }}" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
+            > /tmp/custom-wazuh-rules.manifest
+          find "{{ custom_wazuh_decoders_source }}" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
+            > /tmp/custom-wazuh-decoders.manifest
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Synchronize custom Wazuh rules
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          container="single-node-wazuh.manager-1"
+          manifest="/var/ossec/etc/.custom-rules.manifest"
+
+          docker exec "$container" sh -c '
+            manifest="$1"
+            if [ -f "$manifest" ]; then
+              while IFS= read -r name; do
+                [ -n "$name" ] && rm -f "/var/ossec/etc/rules/$name"
+              done < "$manifest"
+            fi
+          ' sh "$manifest"
+
+          while IFS= read -r -d '' file; do
+            docker cp "$file" "$container:/var/ossec/etc/rules/$(basename "$file")"
+          done < <(find "{{ custom_wazuh_rules_source }}" -maxdepth 1 -type f -name '*.xml' -print0)
+
+          docker cp /tmp/custom-wazuh-rules.manifest "$container:$manifest"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Synchronize custom Wazuh decoders
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          container="single-node-wazuh.manager-1"
+          manifest="/var/ossec/etc/.custom-decoders.manifest"
+
+          docker exec "$container" sh -c '
+            manifest="$1"
+            if [ -f "$manifest" ]; then
+              while IFS= read -r name; do
+                [ -n "$name" ] && rm -f "/var/ossec/etc/decoders/$name"
+              done < "$manifest"
+            fi
+          ' sh "$manifest"
+
+          while IFS= read -r -d '' file; do
+            docker cp "$file" "$container:/var/ossec/etc/decoders/$(basename "$file")"
+          done < <(find "{{ custom_wazuh_decoders_source }}" -maxdepth 1 -type f -name '*.xml' -print0)
+
+          docker cp /tmp/custom-wazuh-decoders.manifest "$container:$manifest"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Set Wazuh rules and decoders permissions
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          exec -T -u 0 wazuh.manager
+          sh -c '
+          find /var/ossec/etc/rules -maxdepth 1 -type f -name "*.xml"
+          -exec chown wazuh:wazuh {} \; &&
+          find /var/ossec/etc/rules -maxdepth 1 -type f -name "*.xml"
+          -exec chmod 660 {} \; &&
+          find /var/ossec/etc/decoders -maxdepth 1 -type f -name "*.xml"
+          -exec chown wazuh:wazuh {} \; &&
+          find /var/ossec/etc/decoders -maxdepth 1 -type f -name "*.xml"
+          -exec chmod 660 {} \;
+          '
+        chdir: "{{ wazuh_directory }}/single-node"
+      changed_when: true
+
+    - name: Validate Wazuh rules and decoders
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          exec -T wazuh.manager
+          /var/ossec/bin/wazuh-analysisd -t
+        chdir: "{{ wazuh_directory }}/single-node"
+      changed_when: false
+
+    - name: Restart Wazuh manager
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          restart wazuh.manager
+        chdir: "{{ wazuh_directory }}/single-node"
+      changed_when: true
+
+    - name: Wait for Wazuh manager after restart
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          ps --status running --services
+        chdir: "{{ wazuh_directory }}/single-node"
+      register: wazuh_services_after_restart
+      retries: 60
+      delay: 5
+      until: "'wazuh.manager' in wazuh_services_after_restart.stdout_lines"
+      changed_when: false
+
+    - name: Validate Wazuh after restart
+      ansible.builtin.command:
+        cmd: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.proxy.yml
+          exec -T wazuh.manager
+          /var/ossec/bin/wazuh-analysisd -t
+        chdir: "{{ wazuh_directory }}/single-node"
+      changed_when: false
+
+    ####################################################################
+    # ZABBIX SERVER, DATABASE AND WEB
+    ####################################################################
+
+    - name: Create Zabbix directory
+      ansible.builtin.file:
+        path: "{{ zabbix_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Create Zabbix environment file
+      ansible.builtin.template:
+        src: zabbix.env.j2
+        dest: "{{ zabbix_directory }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Create Zabbix MySQL configuration
+      ansible.builtin.template:
+        src: zabbix-mysql.cnf.j2
+        dest: "{{ zabbix_directory }}/mysql-zabbix.cnf"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create Zabbix web image Dockerfile
+      ansible.builtin.template:
+        src: zabbix-web.Dockerfile.j2
+        dest: "{{ zabbix_directory }}/Dockerfile.web"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create Zabbix Compose file
+      ansible.builtin.template:
+        src: zabbix-compose.yml.j2
+        dest: "{{ zabbix_directory }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Validate Zabbix Compose file
+      ansible.builtin.command:
+        cmd: docker compose config --quiet
+        chdir: "{{ zabbix_directory }}"
+      changed_when: false
+
+    - name: Start Zabbix stack
+      ansible.builtin.command:
+        cmd: docker compose up -d --build --pull always --remove-orphans
+        chdir: "{{ zabbix_directory }}"
+      changed_when: true
+
+    - name: Wait for Zabbix database
+      ansible.builtin.command:
+        cmd: docker inspect --format "{{ '{{' }}.State.Health.Status{{ '}}' }}" zabbix-db
+      register: zabbix_db_health
+      retries: 60
+      delay: 5
+      until: zabbix_db_health.stdout == "healthy"
+      changed_when: false
+
+    - name: Verify Zabbix database function creator setting
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ zabbix_database_root_password }}"
+          - zabbix-db
+          - mysql
+          - -uroot
+          - -Nse
+          - "SELECT @@GLOBAL.log_bin_trust_function_creators;"
+      register: zabbix_log_bin_trust
+      changed_when: false
+      failed_when: >-
+        zabbix_log_bin_trust.rc != 0
+        or zabbix_log_bin_trust.stdout | trim != "1"
+      no_log: true
+
+    - name: Wait for Zabbix web container
+      ansible.builtin.command:
+        cmd: docker inspect --format "{{ '{{' }}.State.Status{{ '}}' }}" zabbix-web
+      register: zabbix_web_status
+      retries: 60
+      delay: 5
+      until: zabbix_web_status.stdout == "running"
+      changed_when: false
+
+    ####################################################################
+    # ZABBIX AGENT 2 ON HOST
+    ####################################################################
+
+    - name: Download Zabbix repository package
+      ansible.builtin.get_url:
+        url: "{{ zabbix_repository_package_url }}"
+        dest: /tmp/zabbix-release-7.0.deb
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+      when: zabbix_agent2_enabled | bool
+
+    - name: Install Zabbix repository package
+      ansible.builtin.apt:
+        deb: /tmp/zabbix-release-7.0.deb
+        state: present
+      when: zabbix_agent2_enabled | bool
+
+    - name: Install Zabbix Agent 2
+      ansible.builtin.apt:
+        name: zabbix-agent2
+        state: present
+        update_cache: true
+      when: zabbix_agent2_enabled | bool
+
+    - name: Configure Zabbix Agent 2
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: "^\\s*#?\\s*{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - key: Server
+          value: "{{ zabbix_agent_allowed_servers }}"
+        - key: ServerActive
+          value: "{{ zabbix_agent_server_address }}"
+        - key: Hostname
+          value: >-
+            {{
+              zabbix_agent_hostname
+              if zabbix_agent_hostname | length > 0
+              else ansible_facts['hostname']
+            }}
+        - key: ListenIP
+          value: "0.0.0.0"
+        - key: ListenPort
+          value: "{{ zabbix_agent_listen_port }}"
+        - key: HostMetadata
+          value: "{{ zabbix_agent_host_metadata }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: zabbix_agent2_enabled | bool
+
+    - name: Configure Zabbix Agent 2 Docker plugin
+      ansible.builtin.template:
+        src: zabbix-agent2-docker.conf.j2
+        dest: /etc/zabbix/zabbix_agent2.d/docker.conf
+        owner: root
+        group: zabbix
+        mode: "0640"
+      when:
+        - zabbix_agent2_enabled | bool
+        - zabbix_agent_monitor_docker | bool
+
+    - name: Add Zabbix user to Docker group
+      ansible.builtin.user:
+        name: zabbix
+        groups:
+          - docker
+        append: true
+      when:
+        - zabbix_agent2_enabled | bool
+        - zabbix_agent_monitor_docker | bool
+
+    - name: Enable and restart Zabbix Agent 2
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        enabled: true
+        state: restarted
+      when: zabbix_agent2_enabled | bool
+
+    - name: Verify Zabbix Agent 2 service
+      ansible.builtin.command:
+        cmd: systemctl is-active zabbix-agent2
+      register: zabbix_agent_status
+      changed_when: false
+      failed_when: zabbix_agent_status.stdout | trim != "active"
+      when: zabbix_agent2_enabled | bool
+
+    ####################################################################
+    # PATH GATEWAY
+    ####################################################################
+
+    - name: Create path gateway directory
+      ansible.builtin.file:
+        path: "{{ gateway_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Create path gateway Nginx configuration
+      ansible.builtin.template:
+        src: gateway-nginx.conf.j2
+        dest: "{{ gateway_directory }}/nginx.conf"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create path gateway Compose file
+      ansible.builtin.template:
+        src: gateway-compose.yml.j2
+        dest: "{{ gateway_directory }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Validate path gateway Compose file
+      ansible.builtin.command:
+        cmd: docker compose config --quiet
+        chdir: "{{ gateway_directory }}"
+      changed_when: false
+
+    - name: Start path gateway
+      community.docker.docker_compose_v2:
+        project_src: "{{ gateway_directory }}"
+        state: present
+        pull: always
+        remove_orphans: true
+        wait: true
+        wait_timeout: 120
+
+    ####################################################################
+    # VERIFICATION
+    ####################################################################
+
+    - name: Wait for Nginx Proxy Manager
+      ansible.builtin.uri:
+        url: http://127.0.0.1:81
+        status_code:
+          - 200
+          - 301
+          - 302
+        return_content: false
+      register: npm_check
+      retries: 30
+      delay: 5
+      until: npm_check.status in [200, 301, 302]
+
+    - name: Wait for Wazuh through path gateway
+      ansible.builtin.uri:
+        url: http://127.0.0.1/wazuh/
+        status_code:
+          - 200
+          - 302
+          - 401
+        return_content: false
+      register: wazuh_gateway_check
+      retries: 90
+      delay: 10
+      until: wazuh_gateway_check.status in [200, 302, 401]
+
+    - name: Wait for Zabbix through path gateway
+      ansible.builtin.uri:
+        url: http://127.0.0.1/zabbix/
+        status_code:
+          - 200
+          - 301
+          - 302
+        return_content: false
+      register: zabbix_gateway_check
+      retries: 90
+      delay: 10
+      until: zabbix_gateway_check.status in [200, 301, 302]
+
+    - name: Read running containers
+      ansible.builtin.command:
+        cmd: docker ps --format "table {{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}"
+      register: docker_ps_result
+      changed_when: false
+
+    - name: Show deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Wdrożenie zakończone."
+          - "Wazuh: http://{{ deployment_ip }}/wazuh/"
+          - "Zabbix: http://{{ deployment_ip }}/zabbix/"
+          - "Nginx Proxy Manager: http://{{ deployment_ip }}:81"
+          - "Wazuh agent events: {{ deployment_ip }}:1514"
+          - "Wazuh enrollment: {{ deployment_ip }}:1515"
+          - "Wazuh API: https://{{ deployment_ip }}:55000"
+          - "Zabbix server: {{ deployment_ip }}:10051"
+          - "Zabbix Agent 2: {{ deployment_ip }}:{{ zabbix_agent_listen_port }}"
+          - "{{ docker_ps_result.stdout }}"

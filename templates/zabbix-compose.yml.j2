@@ -1,0 +1,118 @@
+services:
+  zabbix-db:
+    image: "{{ zabbix_database_image }}"
+    container_name: zabbix-db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MYSQL_DATABASE: "${ZABBIX_DB_NAME}"
+      MYSQL_USER: "${ZABBIX_DB_USER}"
+      MYSQL_PASSWORD: "${ZABBIX_DB_PASSWORD}"
+      MYSQL_ROOT_PASSWORD: "${ZABBIX_DB_ROOT_PASSWORD}"
+    volumes:
+      - zabbix_db_data:/var/lib/mysql
+      - ./mysql-zabbix.cnf:/etc/mysql/conf.d/99-zabbix.cnf:ro
+    networks:
+      - zabbix_internal
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  zabbix-server:
+    image: "{{ zabbix_server_image }}"
+    container_name: zabbix-server
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      DB_SERVER_HOST: zabbix-db
+      DB_SERVER_PORT: "3306"
+      MYSQL_DATABASE: "${ZABBIX_DB_NAME}"
+      MYSQL_USER: "${ZABBIX_DB_USER}"
+      MYSQL_PASSWORD: "${ZABBIX_DB_PASSWORD}"
+      MYSQL_ROOT_PASSWORD: "${ZABBIX_DB_ROOT_PASSWORD}"
+    depends_on:
+      zabbix-db:
+        condition: service_healthy
+    ports:
+      - "10051:10051"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - zabbix_alertscripts:/usr/lib/zabbix/alertscripts
+      - zabbix_externalscripts:/usr/lib/zabbix/externalscripts
+      - zabbix_modules:/var/lib/zabbix/modules
+      - zabbix_enc:/var/lib/zabbix/enc
+      - zabbix_ssh_keys:/var/lib/zabbix/ssh_keys
+      - zabbix_ssl_certs:/var/lib/zabbix/ssl/certs
+      - zabbix_ssl_keys:/var/lib/zabbix/ssl/keys
+      - zabbix_ssl_ca:/var/lib/zabbix/ssl/ssl_ca
+    networks:
+      - zabbix_internal
+
+  zabbix-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        ZABBIX_WEB_BASE_IMAGE: "{{ zabbix_web_base_image }}"
+    image: local/zabbix-web-nginx-subpath:7.0
+    container_name: zabbix-web
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_PORT: "10051"
+      DB_SERVER_HOST: zabbix-db
+      DB_SERVER_PORT: "3306"
+      MYSQL_DATABASE: "${ZABBIX_DB_NAME}"
+      MYSQL_USER: "${ZABBIX_DB_USER}"
+      MYSQL_PASSWORD: "${ZABBIX_DB_PASSWORD}"
+      PHP_TZ: "{{ timezone }}"
+      ZBX_SERVER_NAME: "{{ zabbix_server_name }}"
+      ENABLE_WEB_ACCESS_LOG: "true"
+    depends_on:
+      zabbix-db:
+        condition: service_healthy
+      zabbix-server:
+        condition: service_started
+    networks:
+      zabbix_internal:
+      proxy:
+        aliases:
+          - zabbix-web
+
+volumes:
+  zabbix_db_data:
+    name: zabbix_db_data
+  zabbix_alertscripts:
+    name: zabbix_alertscripts
+  zabbix_externalscripts:
+    name: zabbix_externalscripts
+  zabbix_modules:
+    name: zabbix_modules
+  zabbix_enc:
+    name: zabbix_enc
+  zabbix_ssh_keys:
+    name: zabbix_ssh_keys
+  zabbix_ssl_certs:
+    name: zabbix_ssl_certs
+  zabbix_ssl_keys:
+    name: zabbix_ssl_keys
+  zabbix_ssl_ca:
+    name: zabbix_ssl_ca
+
+networks:
+  zabbix_internal:
+    name: zabbix_internal
+  proxy:
+    external: true
+    name: "{{ docker_proxy_network }}"

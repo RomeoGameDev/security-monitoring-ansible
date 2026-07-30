@@ -1,0 +1,10 @@
+---
+all:
+  children:
+    docker_servers:
+      hosts:
+        security-monitoring:
+          ansible_connection: local
+          ansible_host: localhost
+          ansible_user: ansible
+          ansible_python_interpreter: /usr/bin/python3

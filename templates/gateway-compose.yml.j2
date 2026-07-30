@@ -1,0 +1,24 @@
+services:
+  path-gateway:
+    image: "{{ gateway_nginx_image }}"
+    container_name: path-gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - proxy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1/healthz >/dev/null 2>&1
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+networks:
+  proxy:
+    external: true
+    name: "{{ docker_proxy_network }}"
