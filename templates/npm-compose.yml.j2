@@ -22,7 +22,9 @@ services:
     volumes:
       - npm_data:/data
       - npm_letsencrypt:/etc/letsencrypt
-    networks:
+      - "{{ npm_directory }}/default-host:/data/nginx/default_host"
+{% if npm_self_signed_enabled_effective %}      - "{{ npm_self_signed_certificate_directory_effective }}:/data/ip-certificates:ro"
+{% endif %}    networks:
       - proxy
       - database
 

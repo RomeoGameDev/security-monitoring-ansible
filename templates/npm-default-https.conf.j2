@@ -1,0 +1,62 @@
+# Managed by Ansible.
+# Default TLS vhost for clients connecting directly by IP without SNI.
+server {
+  listen 443 ssl default_server;
+  listen [::]:443 ssl default_server;
+  server_name _;
+
+  ssl_certificate /data/ip-certificates/monitoring-{{ deployment_ip }}.crt;
+  ssl_certificate_key /data/ip-certificates/monitoring-{{ deployment_ip }}.key;
+  include conf.d/include/ssl-ciphers.conf;
+
+  resolver 127.0.0.11 valid=30s ipv6=off;
+  client_max_body_size 64m;
+
+  location = / {
+    return 302 /zabbix/;
+  }
+
+  location = /zabbix {
+    return 301 /zabbix/;
+  }
+
+  location = /wazuh {
+    return 301 /wazuh/;
+  }
+
+  location /zabbix/ {
+    set $zabbix_upstream zabbix-web-nginx:8080;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Prefix /zabbix;
+    proxy_http_version 1.1;
+
+    proxy_cookie_path / /zabbix/;
+    proxy_redirect ~^https?://[^/]+/(.*)$ /zabbix/$1;
+    proxy_redirect ~^/(.*)$ /zabbix/$1;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_pass http://$zabbix_upstream/;
+  }
+
+  location /wazuh/ {
+    set $wazuh_upstream wazuh-dashboard:5601;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Prefix /wazuh;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $http_connection;
+    proxy_http_version 1.1;
+
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_pass http://$wazuh_upstream;
+  }
+}

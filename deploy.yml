@@ -356,6 +356,14 @@
         group: root
         mode: "0750"
 
+    - name: Create Nginx Proxy Manager default host directory
+      ansible.builtin.file:
+        path: "{{ npm_directory }}/default-host"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Create Nginx Proxy Manager environment
       ansible.builtin.template:
         src: npm.env.j2
@@ -468,6 +476,49 @@
         - path: "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.key"
           mode: "0600"
       when: npm_self_signed_enabled_effective
+
+    - name: Create default HTTPS virtual host for direct IP access
+      ansible.builtin.template:
+        src: npm-default-https.conf.j2
+        dest: "{{ npm_directory }}/default-host/site.conf"
+        owner: root
+        group: root
+        mode: "0644"
+      when: npm_self_signed_enabled_effective
+      register: npm_default_https_config
+
+    - name: Remove managed default HTTPS virtual host when disabled
+      ansible.builtin.file:
+        path: "{{ npm_directory }}/default-host/site.conf"
+        state: absent
+      when: not npm_self_signed_enabled_effective
+      register: npm_default_https_removed
+
+    - name: Validate Nginx Proxy Manager configuration after default HTTPS change
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - nginx-proxy-manager
+          - nginx
+          - -t
+      changed_when: false
+      when:
+        - npm_self_signed_enabled_effective
+        - npm_default_https_config.changed
+
+    - name: Reload Nginx Proxy Manager after default HTTPS change
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - nginx-proxy-manager
+          - nginx
+          - -s
+          - reload
+      when:
+        - npm_self_signed_enabled_effective
+        - npm_default_https_config.changed
 
     ####################################################################
     # WAZUH
