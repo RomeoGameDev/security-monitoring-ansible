@@ -760,7 +760,6 @@
           seed_directory /var/ossec/agentless "{{ wazuh_persistent_directory_effective }}/manager/agentless"
           seed_directory /var/ossec/wodles "{{ wazuh_persistent_directory_effective }}/manager/wodles"
           seed_directory /etc/filebeat "{{ wazuh_persistent_directory_effective }}/manager/filebeat-etc"
-          seed_directory /var/lib/filebeat "{{ wazuh_persistent_directory_effective }}/manager/filebeat-var"
         executable: /bin/bash
       when:
         - security_monitoring_bind_persistent_data_effective
