@@ -288,7 +288,6 @@
         group: "{{ item.group }}"
         mode: "{{ item.mode }}"
       loop:
-        - { path: "{{ shared_database_directory_effective }}/data", owner: root, group: root, mode: "0750" }
         - { path: "{{ npm_directory_effective }}/data", owner: root, group: root, mode: "0750" }
         - { path: "{{ npm_directory_effective }}/letsencrypt", owner: root, group: root, mode: "0750" }
         - { path: "{{ zabbix_directory_effective }}/data/alertscripts", owner: '1997', group: '0', mode: "0770" }
@@ -328,6 +327,60 @@
         owner: root
         group: root
         mode: "0750"
+
+    - name: Pull shared database image for bind storage validation
+      community.docker.docker_image:
+        name: "{{ shared_database_image }}"
+        source: pull
+      when: security_monitoring_bind_persistent_data_effective
+
+    - name: Read MariaDB container user identifiers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --entrypoint
+          - sh
+          - "{{ shared_database_image }}"
+          - -c
+          - 'printf "%s:%s\n" "$(id -u mysql)" "$(id -g mysql)"'
+      register: shared_database_mysql_ids
+      changed_when: false
+      when: security_monitoring_bind_persistent_data_effective
+
+    - name: Resolve MariaDB container user identifiers
+      ansible.builtin.set_fact:
+        shared_database_mysql_uid: "{{ (shared_database_mysql_ids.stdout | trim).split(':')[0] }}"
+        shared_database_mysql_gid: "{{ (shared_database_mysql_ids.stdout | trim).split(':')[1] }}"
+      when: security_monitoring_bind_persistent_data_effective
+
+    - name: Create MariaDB bind data directory with container ownership
+      ansible.builtin.file:
+        path: "{{ shared_database_directory_effective }}/data"
+        state: directory
+        owner: "{{ shared_database_mysql_uid }}"
+        group: "{{ shared_database_mysql_gid }}"
+        mode: "0750"
+      when: security_monitoring_bind_persistent_data_effective
+
+    - name: Verify MariaDB container can write to bind data directory
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --user
+          - "{{ shared_database_mysql_uid }}:{{ shared_database_mysql_gid }}"
+          - --entrypoint
+          - sh
+          - --volume
+          - "{{ shared_database_directory_effective }}/data:/var/lib/mysql"
+          - "{{ shared_database_image }}"
+          - -c
+          - 'touch /var/lib/mysql/.security-monitoring-write-test && rm -f /var/lib/mysql/.security-monitoring-write-test'
+      changed_when: false
+      when: security_monitoring_bind_persistent_data_effective
 
     - name: Create shared database environment
       ansible.builtin.template:
@@ -383,10 +436,10 @@
         cmd: |
           set -euo pipefail
           docker cp "{{ shared_database_directory_effective }}/bootstrap.sql" shared-db:/tmp/bootstrap.sql
-          docker exec \
-            -e MYSQL_PWD="{{ shared_database_root_password }}" \
-            shared-db \
-            sh -c 'mariadb -uroot < /tmp/bootstrap.sql'
+          docker exec shared-db sh -lc '
+            mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" \
+              --show-warnings < /tmp/bootstrap.sql
+          '
           docker exec shared-db rm -f /tmp/bootstrap.sql
         executable: /bin/bash
       changed_when: true

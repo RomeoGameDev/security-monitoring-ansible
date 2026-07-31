@@ -135,3 +135,7 @@ Ponieważ `run.sh -d` zapisuje ścieżkę w `group_vars/all.yml`, skrypt czyszcz
 
 Puste katalogi trwałe Wazuh Managera są inicjalizowane przez oficjalny skrypt startowy obrazu Wazuh.
 Playbook nie kopiuje już ręcznie zawartości `/var/ossec`, dzięki czemu nie dubluje mechanizmu obrazu i nie tworzy niepełnego `ossec.conf`.
+
+### MariaDB na bind-mouncie
+
+Przed uruchomieniem bazy playbook odczytuje UID/GID użytkownika `mysql` z wybranego obrazu MariaDB, ustawia właściciela katalogu danych i wykonuje test zapisu z tożsamością procesu bazodanowego. Zapobiega to częściowej inicjalizacji bazy na katalogu bez praw zapisu.
