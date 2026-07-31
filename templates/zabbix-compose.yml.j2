@@ -1,29 +1,4 @@
 services:
-  zabbix-db:
-    image: "{{ zabbix_database_image }}"
-    container_name: zabbix-db
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      MYSQL_DATABASE: "${ZABBIX_DB_NAME}"
-      MYSQL_USER: "${ZABBIX_DB_USER}"
-      MYSQL_PASSWORD: "${ZABBIX_DB_PASSWORD}"
-      MYSQL_ROOT_PASSWORD: "${ZABBIX_DB_ROOT_PASSWORD}"
-    volumes:
-      - zabbix_db_data:/var/lib/mysql
-      - ./mysql-zabbix.cnf:/etc/mysql/conf.d/99-zabbix.cnf:ro
-    networks:
-      - zabbix_internal
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 40s
-
   zabbix-server:
     image: "{{ zabbix_server_image }}"
     container_name: zabbix-server
@@ -32,15 +7,11 @@ services:
     env_file:
       - .env
     environment:
-      DB_SERVER_HOST: zabbix-db
+      DB_SERVER_HOST: shared-db
       DB_SERVER_PORT: "3306"
       MYSQL_DATABASE: "${ZABBIX_DB_NAME}"
       MYSQL_USER: "${ZABBIX_DB_USER}"
       MYSQL_PASSWORD: "${ZABBIX_DB_PASSWORD}"
-      MYSQL_ROOT_PASSWORD: "${ZABBIX_DB_ROOT_PASSWORD}"
-    depends_on:
-      zabbix-db:
-        condition: service_healthy
     ports:
       - "10051:10051"
     extra_hosts:
@@ -55,6 +26,7 @@ services:
       - zabbix_ssl_keys:/var/lib/zabbix/ssl/keys
       - zabbix_ssl_ca:/var/lib/zabbix/ssl/ssl_ca
     networks:
+      - database
       - zabbix_internal
 
   zabbix-web:
@@ -71,7 +43,7 @@ services:
     environment:
       ZBX_SERVER_HOST: zabbix-server
       ZBX_SERVER_PORT: "10051"
-      DB_SERVER_HOST: zabbix-db
+      DB_SERVER_HOST: shared-db
       DB_SERVER_PORT: "3306"
       MYSQL_DATABASE: "${ZABBIX_DB_NAME}"
       MYSQL_USER: "${ZABBIX_DB_USER}"
@@ -79,20 +51,16 @@ services:
       PHP_TZ: "{{ timezone }}"
       ZBX_SERVER_NAME: "{{ zabbix_server_name }}"
       ENABLE_WEB_ACCESS_LOG: "true"
-    depends_on:
-      zabbix-db:
-        condition: service_healthy
-      zabbix-server:
-        condition: service_started
+    ports:
+      - "127.0.0.1:8081:8080"
     networks:
       zabbix_internal:
+      database:
       proxy:
         aliases:
           - zabbix-web
 
 volumes:
-  zabbix_db_data:
-    name: zabbix_db_data
   zabbix_alertscripts:
     name: zabbix_alertscripts
   zabbix_externalscripts:
@@ -113,6 +81,9 @@ volumes:
 networks:
   zabbix_internal:
     name: zabbix_internal
+  database:
+    external: true
+    name: "{{ docker_database_network }}"
   proxy:
     external: true
     name: "{{ docker_proxy_network }}"

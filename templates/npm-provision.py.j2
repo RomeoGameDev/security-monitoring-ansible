@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = "http://127.0.0.1:81/api"
+IDENTITY = {{ npm_admin_email | to_json }}
+SECRET = {{ npm_admin_password | to_json }}
+DEPLOYMENT_IP = {{ deployment_ip | to_json }}
+
+
+def request(method, path, body=None, token=None):
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(
+        API + path,
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read().decode("utf-8")
+        return json.loads(raw) if raw else None
+
+
+for attempt in range(60):
+    try:
+        token_response = request(
+            "POST",
+            "/tokens",
+            {"identity": IDENTITY, "secret": SECRET},
+        )
+        token = token_response["token"]
+        break
+    except Exception as exc:
+        if attempt == 59:
+            raise RuntimeError(f"Nie można zalogować do API NPM: {exc}") from exc
+        time.sleep(5)
+else:
+    raise RuntimeError("Nie uzyskano tokenu NPM")
+
+hosts = request("GET", "/nginx/proxy-hosts", token=token)
+existing = next(
+    (host for host in hosts if DEPLOYMENT_IP in host.get("domain_names", [])),
+    None,
+)
+
+advanced_config = """location = / { return 302 /wazuh/; }
+location = /wazuh { return 301 /wazuh/; }
+location = /zabbix { return 301 /zabbix/; }
+client_max_body_size 64m;
+"""
+
+locations = [
+    {
+        "path": "/wazuh/",
+        "forward_scheme": "http",
+        "forward_host": "wazuh-dashboard",
+        "forward_port": 5601,
+        "forward_path": "",
+        "advanced_config": (
+            "proxy_buffering off;\n"
+            "proxy_read_timeout 3600s;\n"
+            "proxy_send_timeout 3600s;\n"
+            "proxy_set_header X-Forwarded-Prefix /wazuh;"
+        ),
+    },
+    {
+        "path": "/zabbix/",
+        "forward_scheme": "http",
+        "forward_host": "zabbix-web",
+        "forward_port": 8080,
+        "forward_path": "",
+        "advanced_config": (
+            "proxy_read_timeout 300s;\n"
+            "proxy_set_header X-Forwarded-Prefix /zabbix;\n"
+            "proxy_cookie_path / /zabbix/;"
+        ),
+    },
+]
+
+payload = {
+    "domain_names": [DEPLOYMENT_IP],
+    "forward_scheme": "http",
+    "forward_host": "wazuh-dashboard",
+    "forward_port": 5601,
+    "access_list_id": 0,
+    "certificate_id": 0,
+    "ssl_forced": False,
+    "caching_enabled": False,
+    "block_exploits": False,
+    "advanced_config": advanced_config,
+    "meta": {},
+    "allow_websocket_upgrade": True,
+    "http2_support": False,
+    "hsts_enabled": False,
+    "hsts_subdomains": False,
+    "trust_forwarded_proto": False,
+    "enabled": True,
+    "locations": locations,
+}
+
+if existing:
+    # Zachowaj domeny i konfigurację SSL dodaną ręcznie w NPM.
+    payload["domain_names"] = list(dict.fromkeys(existing.get("domain_names", []) + [DEPLOYMENT_IP]))
+    for key in (
+        "access_list_id",
+        "certificate_id",
+        "ssl_forced",
+        "http2_support",
+        "hsts_enabled",
+        "hsts_subdomains",
+        "trust_forwarded_proto",
+    ):
+        if key in existing:
+            payload[key] = existing[key]
+    result = request("PUT", f"/nginx/proxy-hosts/{existing['id']}", payload, token)
+    action = "updated"
+else:
+    result = request("POST", "/nginx/proxy-hosts", payload, token)
+    action = "created"
+
+print(json.dumps({"action": action, "id": result.get("id"), "ip": DEPLOYMENT_IP}))

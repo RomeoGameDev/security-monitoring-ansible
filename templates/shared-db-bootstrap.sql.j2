@@ -1,0 +1,21 @@
+CREATE DATABASE IF NOT EXISTS `{{ npm_database_name }}`
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE DATABASE IF NOT EXISTS `{{ zabbix_database_name }}`
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+
+CREATE USER IF NOT EXISTS '{{ npm_database_user }}'@'%'
+  IDENTIFIED BY '{{ npm_database_password }}';
+ALTER USER '{{ npm_database_user }}'@'%'
+  IDENTIFIED BY '{{ npm_database_password }}';
+GRANT ALL PRIVILEGES ON `{{ npm_database_name }}`.*
+  TO '{{ npm_database_user }}'@'%';
+
+CREATE USER IF NOT EXISTS '{{ zabbix_database_user }}'@'%'
+  IDENTIFIED BY '{{ zabbix_database_password }}';
+ALTER USER '{{ zabbix_database_user }}'@'%'
+  IDENTIFIED BY '{{ zabbix_database_password }}';
+GRANT ALL PRIVILEGES ON `{{ zabbix_database_name }}`.*
+  TO '{{ zabbix_database_user }}'@'%';
+
+FLUSH PRIVILEGES;

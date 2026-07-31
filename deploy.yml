@@ -1,5 +1,5 @@
 ---
-- name: Deploy Wazuh, SOCFortress, Zabbix and reverse proxy
+- name: Deploy Wazuh, SOCFortress, Zabbix and Nginx Proxy Manager
   hosts: docker_servers
   become: true
   gather_facts: true
@@ -22,6 +22,27 @@
           Obsługiwane systemy to Ubuntu 24.04+ oraz Debian 13+.
           Wykryto {{ ansible_facts["distribution"] }}
           {{ ansible_facts["distribution_version"] }}.
+
+    - name: Validate passwords and required secrets
+      ansible.builtin.assert:
+        that:
+          - item.value is not match('^CHANGE_ME')
+          - item.value is match('^[A-Za-z0-9_.@!#%+=:-]{12,64}$')
+        fail_msg: >-
+          Zmień {{ item.name }} w group_vars/all.yml.
+          Użyj 12-64 znaków: litery, cyfry oraz _ . @ ! # % + = : -
+      loop:
+        - name: shared_database_root_password
+          value: "{{ shared_database_root_password }}"
+        - name: npm_database_password
+          value: "{{ npm_database_password }}"
+        - name: zabbix_database_password
+          value: "{{ zabbix_database_password }}"
+        - name: npm_admin_password
+          value: "{{ npm_admin_password }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
 
     - name: Set deployment facts
       ansible.builtin.set_fact:
@@ -71,7 +92,6 @@
           - gnupg
           - python3
           - python3-requests
-          - python3-debian
           - rsync
           - unzip
         state: present
@@ -157,7 +177,7 @@
           - docker-buildx-plugin
           - docker-compose-plugin
         state: present
-        update_cache: true
+        update_cache: "{{ docker_repository.changed }}"
 
     - name: Enable Docker
       ansible.builtin.systemd_service:
@@ -180,14 +200,127 @@
         state: present
         reload: true
 
-    - name: Create shared proxy network
+    - name: Create shared Docker networks
       community.docker.docker_network:
-        name: "{{ docker_proxy_network }}"
+        name: "{{ item }}"
         state: present
+      loop:
+        - "{{ docker_proxy_network }}"
+        - "{{ docker_database_network }}"
+
+    ####################################################################
+    # SHARED MARIADB
+    ####################################################################
+
+    - name: Create shared database directory
+      ansible.builtin.file:
+        path: "{{ shared_database_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Create shared database environment
+      ansible.builtin.template:
+        src: shared-db.env.j2
+        dest: "{{ shared_database_directory }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Create shared database configuration
+      ansible.builtin.template:
+        src: shared-db.cnf.j2
+        dest: "{{ shared_database_directory }}/99-shared-database.cnf"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create shared database Compose file
+      ansible.builtin.template:
+        src: shared-db-compose.yml.j2
+        dest: "{{ shared_database_directory }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Create database bootstrap SQL
+      ansible.builtin.template:
+        src: shared-db-bootstrap.sql.j2
+        dest: "{{ shared_database_directory }}/bootstrap.sql"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Validate shared database Compose file
+      ansible.builtin.command:
+        cmd: docker compose config --quiet
+        chdir: "{{ shared_database_directory }}"
+      changed_when: false
+
+    - name: Start shared database
+      community.docker.docker_compose_v2:
+        project_src: "{{ shared_database_directory }}"
+        state: present
+        pull: always
+        remove_orphans: true
+        wait: true
+        wait_timeout: 300
+
+    - name: Bootstrap NPM and Zabbix databases
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          docker cp "{{ shared_database_directory }}/bootstrap.sql" shared-db:/tmp/bootstrap.sql
+          docker exec \
+            -e MYSQL_PWD="{{ shared_database_root_password }}" \
+            shared-db \
+            sh -c 'mariadb -uroot < /tmp/bootstrap.sql'
+          docker exec shared-db rm -f /tmp/bootstrap.sql
+        executable: /bin/bash
+      changed_when: true
+      no_log: true
+
+    - name: Verify log_bin_trust_function_creators
+      ansible.builtin.command:
+        cmd: >-
+          docker exec
+          -e MYSQL_PWD={{ shared_database_root_password }}
+          shared-db
+          mariadb -uroot -Nse
+          "SELECT @@GLOBAL.log_bin_trust_function_creators;"
+      register: shared_database_function_creators
+      changed_when: false
+      failed_when:
+        - shared_database_function_creators.rc != 0
+          or shared_database_function_creators.stdout | trim != "1"
+      no_log: true
+
+    - name: Remove database bootstrap SQL from host
+      ansible.builtin.file:
+        path: "{{ shared_database_directory }}/bootstrap.sql"
+        state: absent
 
     ####################################################################
     # NGINX PROXY MANAGER
     ####################################################################
+
+    - name: Remove legacy proxy and database containers
+      ansible.builtin.command:
+        cmd: docker rm -f {{ item }}
+      loop:
+        - path-gateway
+        - nginx-proxy-manager-db
+        - zabbix-db
+      changed_when: false
+      failed_when: false
+
+    - name: Remove legacy path gateway directory
+      ansible.builtin.file:
+        path: /opt/path-gateway
+        state: absent
 
     - name: Create Nginx Proxy Manager directory
       ansible.builtin.file:
@@ -226,8 +359,19 @@
         state: present
         pull: always
         remove_orphans: true
-        wait: true
-        wait_timeout: 240
+        wait: false
+
+    - name: Wait for Nginx Proxy Manager API
+      ansible.builtin.uri:
+        url: http://127.0.0.1:81/api/
+        status_code:
+          - 200
+          - 401
+        return_content: false
+      register: npm_api_check
+      retries: 60
+      delay: 5
+      until: npm_api_check.status in [200, 401]
 
     ####################################################################
     # WAZUH
@@ -260,18 +404,10 @@
         src: "{{ wazuh_directory }}/single-node/config/wazuh_dashboard/wazuh.yml"
         dest: "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml"
         remote_src: true
-        owner: "{{ wazuh_dashboard_uid }}"
-        group: "{{ wazuh_dashboard_gid }}"
+        owner: root
+        group: root
         mode: "0660"
       when: not persistent_wazuh_dashboard_config.stat.exists
-
-    - name: Set persistent Wazuh Dashboard configuration permissions
-      ansible.builtin.file:
-        path: "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml"
-        state: file
-        owner: "{{ wazuh_dashboard_uid }}"
-        group: "{{ wazuh_dashboard_gid }}"
-        mode: "0660"
 
     - name: Configure Wazuh Dashboard base path
       ansible.builtin.lineinfile:
@@ -360,18 +496,20 @@
         - "'wazuh.dashboard' in wazuh_running_services.stdout_lines"
       changed_when: false
 
-    - name: Verify Wazuh Dashboard application configuration is writable
+    - name: Make Wazuh Dashboard application configuration writable
       ansible.builtin.command:
         cmd: >-
           docker compose
           -f docker-compose.yml
           -f docker-compose.proxy.yml
-          exec -T
-          -u {{ wazuh_dashboard_uid }}:{{ wazuh_dashboard_gid }}
-          wazuh.dashboard
-          test -w /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
+          exec -T -u 0 wazuh.dashboard
+          sh -c '
+          owner="$(stat -c "%u:%g" /usr/share/wazuh-dashboard/data/wazuh/config)" &&
+          chown "$owner" /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml &&
+          chmod 660 /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
+          '
         chdir: "{{ wazuh_directory }}/single-node"
-      changed_when: false
+      changed_when: true
 
     ####################################################################
     # SOCFORTRESS
@@ -425,7 +563,6 @@
 
           while IFS= read -r -d '' file; do
             name="$(basename "$file")"
-
             case "$name" in
               decoder-linux-sysmon.xml|yara_decoders.xml|auditd_decoders.xml|naxsi-opnsense_decoders.xml|maltrail_decoders.xml|decoder-manager-logs.xml)
                 install -m 0644 "$file" "$decoders/$name"
@@ -446,7 +583,6 @@
 
           find "$rules" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
             > "{{ socfortress_directory }}/socfortress-rules.manifest"
-
           find "$decoders" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
             > "{{ socfortress_directory }}/socfortress-decoders.manifest"
         executable: /bin/bash
@@ -461,17 +597,16 @@
           manifest="/var/ossec/etc/.socfortress-rules.manifest"
 
           docker exec "$container" sh -c '
-            manifest="$1"
+            manifest="/var/ossec/etc/.socfortress-rules.manifest"
             if [ -f "$manifest" ]; then
               while IFS= read -r name; do
                 [ -n "$name" ] && rm -f "/var/ossec/etc/rules/$name"
               done < "$manifest"
             fi
-          ' sh "$manifest"
+          '
 
           docker cp "{{ socfortress_directory }}/rules/." \
             "$container:/var/ossec/etc/rules/"
-
           docker cp "{{ socfortress_directory }}/socfortress-rules.manifest" \
             "$container:$manifest"
         executable: /bin/bash
@@ -486,17 +621,16 @@
           manifest="/var/ossec/etc/.socfortress-decoders.manifest"
 
           docker exec "$container" sh -c '
-            manifest="$1"
+            manifest="/var/ossec/etc/.socfortress-decoders.manifest"
             if [ -f "$manifest" ]; then
               while IFS= read -r name; do
                 [ -n "$name" ] && rm -f "/var/ossec/etc/decoders/$name"
               done < "$manifest"
             fi
-          ' sh "$manifest"
+          '
 
           docker cp "{{ socfortress_directory }}/decoders/." \
             "$container:/var/ossec/etc/decoders/"
-
           docker cp "{{ socfortress_directory }}/socfortress-decoders.manifest" \
             "$container:$manifest"
         executable: /bin/bash
@@ -537,18 +671,18 @@
           manifest="/var/ossec/etc/.custom-rules.manifest"
 
           docker exec "$container" sh -c '
-            manifest="$1"
+            manifest="/var/ossec/etc/.custom-rules.manifest"
             if [ -f "$manifest" ]; then
               while IFS= read -r name; do
                 [ -n "$name" ] && rm -f "/var/ossec/etc/rules/$name"
               done < "$manifest"
             fi
-          ' sh "$manifest"
+          '
 
-          while IFS= read -r -d '' file; do
-            docker cp "$file" "$container:/var/ossec/etc/rules/$(basename "$file")"
-          done < <(find "{{ custom_wazuh_rules_source }}" -maxdepth 1 -type f -name '*.xml' -print0)
-
+          if find "{{ custom_wazuh_rules_source }}" -maxdepth 1 -type f -name '*.xml' | grep -q .; then
+            docker cp "{{ custom_wazuh_rules_source }}/." \
+              "$container:/var/ossec/etc/rules/"
+          fi
           docker cp /tmp/custom-wazuh-rules.manifest "$container:$manifest"
         executable: /bin/bash
       changed_when: true
@@ -561,18 +695,18 @@
           manifest="/var/ossec/etc/.custom-decoders.manifest"
 
           docker exec "$container" sh -c '
-            manifest="$1"
+            manifest="/var/ossec/etc/.custom-decoders.manifest"
             if [ -f "$manifest" ]; then
               while IFS= read -r name; do
                 [ -n "$name" ] && rm -f "/var/ossec/etc/decoders/$name"
               done < "$manifest"
             fi
-          ' sh "$manifest"
+          '
 
-          while IFS= read -r -d '' file; do
-            docker cp "$file" "$container:/var/ossec/etc/decoders/$(basename "$file")"
-          done < <(find "{{ custom_wazuh_decoders_source }}" -maxdepth 1 -type f -name '*.xml' -print0)
-
+          if find "{{ custom_wazuh_decoders_source }}" -maxdepth 1 -type f -name '*.xml' | grep -q .; then
+            docker cp "{{ custom_wazuh_decoders_source }}/." \
+              "$container:/var/ossec/etc/decoders/"
+          fi
           docker cp /tmp/custom-wazuh-decoders.manifest "$container:$manifest"
         executable: /bin/bash
       changed_when: true
@@ -644,7 +778,7 @@
       changed_when: false
 
     ####################################################################
-    # ZABBIX SERVER, DATABASE AND WEB
+    # ZABBIX SERVER AND WEB
     ####################################################################
 
     - name: Create Zabbix directory
@@ -663,14 +797,6 @@
         group: root
         mode: "0600"
       no_log: true
-
-    - name: Create Zabbix MySQL configuration
-      ansible.builtin.template:
-        src: zabbix-mysql.cnf.j2
-        dest: "{{ zabbix_directory }}/mysql-zabbix.cnf"
-        owner: root
-        group: root
-        mode: "0644"
 
     - name: Create Zabbix web image Dockerfile
       ansible.builtin.template:
@@ -700,42 +826,25 @@
         chdir: "{{ zabbix_directory }}"
       changed_when: true
 
-    - name: Wait for Zabbix database
-      ansible.builtin.command:
-        cmd: docker inspect --format "{{ '{{' }}.State.Health.Status{{ '}}' }}" zabbix-db
-      register: zabbix_db_health
-      retries: 60
+    - name: Wait for Zabbix API
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: application/json-rpc
+        body:
+          jsonrpc: "2.0"
+          method: apiinfo.version
+          params: []
+          id: 1
+        status_code: 200
+      register: zabbix_api_health
+      retries: 90
       delay: 5
-      until: zabbix_db_health.stdout == "healthy"
-      changed_when: false
-
-    - name: Verify Zabbix database function creator setting
-      ansible.builtin.command:
-        argv:
-          - docker
-          - exec
-          - -e
-          - "MYSQL_PWD={{ zabbix_database_root_password }}"
-          - zabbix-db
-          - mysql
-          - -uroot
-          - -Nse
-          - "SELECT @@GLOBAL.log_bin_trust_function_creators;"
-      register: zabbix_log_bin_trust
-      changed_when: false
-      failed_when: >-
-        zabbix_log_bin_trust.rc != 0
-        or zabbix_log_bin_trust.stdout | trim != "1"
-      no_log: true
-
-    - name: Wait for Zabbix web container
-      ansible.builtin.command:
-        cmd: docker inspect --format "{{ '{{' }}.State.Status{{ '}}' }}" zabbix-web
-      register: zabbix_web_status
-      retries: 60
-      delay: 5
-      until: zabbix_web_status.stdout == "running"
-      changed_when: false
+      until: >-
+        zabbix_api_health.json is defined
+        and zabbix_api_health.json.result is defined
 
     ####################################################################
     # ZABBIX AGENT 2 ON HOST
@@ -767,7 +876,7 @@
     - name: Configure Zabbix Agent 2
       ansible.builtin.lineinfile:
         path: /etc/zabbix/zabbix_agent2.conf
-        regexp: "^\\s*#?\\s*{{ item.key }}="
+        regexp: "^#?{{ item.key }}="
         line: "{{ item.key }}={{ item.value }}"
       loop:
         - key: Server
@@ -775,14 +884,9 @@
         - key: ServerActive
           value: "{{ zabbix_agent_server_address }}"
         - key: Hostname
-          value: >-
-            {{
-              zabbix_agent_hostname
-              if zabbix_agent_hostname | length > 0
-              else ansible_facts['hostname']
-            }}
+          value: "{{ zabbix_agent_hostname }}"
         - key: ListenIP
-          value: "0.0.0.0"
+          value: 0.0.0.0
         - key: ListenPort
           value: "{{ zabbix_agent_listen_port }}"
         - key: HostMetadata
@@ -828,90 +932,195 @@
       when: zabbix_agent2_enabled | bool
 
     ####################################################################
-    # PATH GATEWAY
+    # INITIAL ZABBIX HOST INTERFACE
     ####################################################################
 
-    - name: Create path gateway directory
-      ansible.builtin.file:
-        path: "{{ gateway_directory }}"
-        state: directory
+    - name: Check Zabbix interface provisioning marker
+      ansible.builtin.stat:
+        path: "{{ zabbix_directory }}/.default-agent-interface-provisioned"
+      register: zabbix_interface_marker
+
+    - name: Login to Zabbix API for initial provisioning
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: application/json-rpc
+        body:
+          jsonrpc: "2.0"
+          method: user.login
+          params:
+            username: "{{ zabbix_initial_admin_user }}"
+            password: "{{ zabbix_initial_admin_password }}"
+          id: 1
+        status_code: 200
+      register: zabbix_login
+      retries: 60
+      delay: 5
+      until: >-
+        zabbix_login.json is defined
+        and zabbix_login.json.result is defined
+      when: not zabbix_interface_marker.stat.exists
+      no_log: true
+
+    - name: Read default Zabbix host interface
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: application/json-rpc
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            filter:
+              host:
+                - "{{ zabbix_agent_hostname }}"
+            selectInterfaces:
+              - interfaceid
+              - ip
+              - dns
+              - useip
+              - port
+          auth: "{{ zabbix_login.json.result }}"
+          id: 2
+        status_code: 200
+      register: zabbix_default_host
+      retries: 30
+      delay: 5
+      until: >-
+        zabbix_default_host.json is defined
+        and zabbix_default_host.json.result is defined
+        and zabbix_default_host.json.result | length > 0
+        and zabbix_default_host.json.result[0].interfaces | length > 0
+      when: not zabbix_interface_marker.stat.exists
+      no_log: true
+
+    - name: Set default Zabbix interface identifier
+      ansible.builtin.set_fact:
+        zabbix_default_interface_id: >-
+          {{ (zabbix_default_host.json.result[0].interfaces | first).interfaceid }}
+      when:
+        - not zabbix_interface_marker.stat.exists
+        - zabbix_default_host.json.result | length > 0
+        - zabbix_default_host.json.result[0].interfaces | length > 0
+
+    - name: Configure default Zabbix host to reach Agent 2 on host
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: application/json-rpc
+        body:
+          jsonrpc: "2.0"
+          method: hostinterface.update
+          params:
+            interfaceid: "{{ zabbix_default_interface_id }}"
+            useip: 0
+            ip: ""
+            dns: host.docker.internal
+            port: "{{ zabbix_agent_listen_port }}"
+          auth: "{{ zabbix_login.json.result }}"
+          id: 3
+        status_code: 200
+      register: zabbix_interface_update
+      failed_when:
+        - zabbix_interface_update.json is not defined
+          or zabbix_interface_update.json.result is not defined
+      when:
+        - not zabbix_interface_marker.stat.exists
+        - zabbix_default_interface_id is defined
+      no_log: true
+
+    - name: Create Zabbix interface provisioning marker
+      ansible.builtin.copy:
+        dest: "{{ zabbix_directory }}/.default-agent-interface-provisioned"
+        content: "host.docker.internal:{{ zabbix_agent_listen_port }}\n"
         owner: root
         group: root
-        mode: "0750"
+        mode: "0600"
+      when:
+        - not zabbix_interface_marker.stat.exists
+        - zabbix_default_interface_id is defined
 
-    - name: Create path gateway Nginx configuration
+    ####################################################################
+    # NPM IP ROUTING
+    ####################################################################
+
+    - name: Check NPM IP routing marker
+      ansible.builtin.stat:
+        path: "{{ npm_directory }}/.ip-routing-provisioned"
+      register: npm_routing_marker
+
+    - name: Create NPM IP routing provisioner
       ansible.builtin.template:
-        src: gateway-nginx.conf.j2
-        dest: "{{ gateway_directory }}/nginx.conf"
+        src: npm-provision.py.j2
+        dest: "{{ npm_directory }}/provision-ip-routing.py"
         owner: root
         group: root
-        mode: "0644"
+        mode: "0700"
+      when: not npm_routing_marker.stat.exists
+      no_log: true
 
-    - name: Create path gateway Compose file
-      ansible.builtin.template:
-        src: gateway-compose.yml.j2
-        dest: "{{ gateway_directory }}/docker-compose.yml"
-        owner: root
-        group: root
-        mode: "0640"
-
-    - name: Validate path gateway Compose file
+    - name: Provision IP routing in Nginx Proxy Manager
       ansible.builtin.command:
-        cmd: docker compose config --quiet
-        chdir: "{{ gateway_directory }}"
-      changed_when: false
+        cmd: "{{ npm_directory }}/provision-ip-routing.py"
+      register: npm_routing_result
+      when: not npm_routing_marker.stat.exists
+      changed_when: true
 
-    - name: Start path gateway
-      community.docker.docker_compose_v2:
-        project_src: "{{ gateway_directory }}"
-        state: present
-        pull: always
-        remove_orphans: true
-        wait: true
-        wait_timeout: 120
+    - name: Create NPM IP routing marker
+      ansible.builtin.copy:
+        dest: "{{ npm_directory }}/.ip-routing-provisioned"
+        content: "{{ deployment_ip }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - not npm_routing_marker.stat.exists
+        - npm_routing_result.rc == 0
+
+    - name: Remove NPM routing provisioner containing credentials
+      ansible.builtin.file:
+        path: "{{ npm_directory }}/provision-ip-routing.py"
+        state: absent
 
     ####################################################################
     # VERIFICATION
     ####################################################################
 
-    - name: Wait for Nginx Proxy Manager
+    - name: Wait for Wazuh through Nginx Proxy Manager
       ansible.builtin.uri:
-        url: http://127.0.0.1:81
-        status_code:
-          - 200
-          - 301
-          - 302
-        return_content: false
-      register: npm_check
-      retries: 30
-      delay: 5
-      until: npm_check.status in [200, 301, 302]
-
-    - name: Wait for Wazuh through path gateway
-      ansible.builtin.uri:
-        url: http://127.0.0.1/wazuh/
+        url: "http://127.0.0.1/wazuh/"
+        headers:
+          Host: "{{ deployment_ip }}"
         status_code:
           - 200
           - 302
           - 401
         return_content: false
-      register: wazuh_gateway_check
+      register: wazuh_npm_check
       retries: 90
       delay: 10
-      until: wazuh_gateway_check.status in [200, 302, 401]
+      until: wazuh_npm_check.status in [200, 302, 401]
 
-    - name: Wait for Zabbix through path gateway
+    - name: Wait for Zabbix through Nginx Proxy Manager
       ansible.builtin.uri:
-        url: http://127.0.0.1/zabbix/
+        url: "http://127.0.0.1/zabbix/"
+        headers:
+          Host: "{{ deployment_ip }}"
         status_code:
           - 200
           - 301
           - 302
         return_content: false
-      register: zabbix_gateway_check
+      register: zabbix_npm_check
       retries: 90
       delay: 10
-      until: zabbix_gateway_check.status in [200, 301, 302]
+      until: zabbix_npm_check.status in [200, 301, 302]
 
     - name: Read running containers
       ansible.builtin.command:
@@ -926,6 +1135,7 @@
           - "Wazuh: http://{{ deployment_ip }}/wazuh/"
           - "Zabbix: http://{{ deployment_ip }}/zabbix/"
           - "Nginx Proxy Manager: http://{{ deployment_ip }}:81"
+          - "NPM login: {{ npm_admin_email }}"
           - "Wazuh agent events: {{ deployment_ip }}:1514"
           - "Wazuh enrollment: {{ deployment_ip }}:1515"
           - "Wazuh API: https://{{ deployment_ip }}:55000"

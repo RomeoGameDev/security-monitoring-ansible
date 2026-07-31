@@ -1,0 +1,36 @@
+services:
+  shared-db:
+    image: "{{ shared_database_image }}"
+    container_name: shared-db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MARIADB_ROOT_PASSWORD: "${MARIADB_ROOT_PASSWORD}"
+      MARIADB_AUTO_UPGRADE: "1"
+    volumes:
+      - shared_db_data:/var/lib/mysql
+      - ./99-shared-database.cnf:/etc/mysql/conf.d/99-shared-database.cnf:ro
+    networks:
+      database:
+        aliases:
+          - shared-db
+    healthcheck:
+      test:
+        - CMD
+        - healthcheck.sh
+        - --connect
+        - --innodb_initialized
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+volumes:
+  shared_db_data:
+    name: shared_db_data
+
+networks:
+  database:
+    external: true
+    name: "{{ docker_database_network }}"
