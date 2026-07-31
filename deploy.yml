@@ -75,6 +75,14 @@
             else ansible_facts['distribution_major_version']
           }}
 
+    - name: Resolve optional NPM TLS settings
+      ansible.builtin.set_fact:
+        npm_self_signed_enabled_effective: "{{ npm_self_signed_enabled | default(true) | bool }}"
+        npm_self_signed_days_effective: "{{ npm_self_signed_days | default(3650) | int }}"
+        npm_force_ssl_effective: "{{ npm_force_ssl | default(false) | bool }}"
+        npm_self_signed_certificate_directory_effective: >-
+          {{ npm_self_signed_certificate_directory | default(npm_directory ~ '/certificates') }}
+
     - name: Build Zabbix repository package URL
       ansible.builtin.set_fact:
         zabbix_repository_package_url: >-
@@ -87,8 +95,13 @@
           - "IP: {{ deployment_ip }}"
           - "System: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
           - "Wazuh: http://{{ deployment_ip }}/wazuh/"
-          - "Zabbix: http://{{ deployment_ip }}/"
-          - "Zabbix alias: http://{{ deployment_ip }}/zabbix/ -> /"
+          - "Zabbix: http://{{ deployment_ip }}/zabbix/"
+          - >-
+            {{
+              'HTTPS self-signed: https://' ~ deployment_ip ~ '/wazuh/ oraz /zabbix/'
+              if npm_self_signed_enabled_effective
+              else 'HTTPS self-signed: wyłączony'
+            }}
 
   tasks:
     ####################################################################
@@ -104,6 +117,7 @@
           - gnupg
           - python3
           - python3-requests
+          - openssl
           - rsync
           - unzip
         state: present
@@ -384,6 +398,76 @@
       retries: 60
       delay: 5
       until: npm_api_check.status in [200, 401]
+
+    - name: Create self-signed certificate directory
+      ansible.builtin.file:
+        path: "{{ npm_self_signed_certificate_directory_effective }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: npm_self_signed_enabled_effective
+
+    - name: Check self-signed certificate
+      ansible.builtin.stat:
+        path: "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.crt"
+      register: npm_self_signed_certificate
+      when: npm_self_signed_enabled_effective
+
+    - name: Check self-signed private key
+      ansible.builtin.stat:
+        path: "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.key"
+      register: npm_self_signed_key
+      when: npm_self_signed_enabled_effective
+
+    - name: Remove incomplete self-signed certificate pair
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.crt"
+        - "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.key"
+      when:
+        - npm_self_signed_enabled_effective
+        - not npm_self_signed_certificate.stat.exists or not npm_self_signed_key.stat.exists
+
+    - name: Generate self-signed certificate for deployment IP
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -nodes
+          - -newkey
+          - rsa:2048
+          - -sha256
+          - -days
+          - "{{ npm_self_signed_days_effective | string }}"
+          - -keyout
+          - "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.key"
+          - -out
+          - "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.crt"
+          - -subj
+          - "/CN={{ deployment_ip }}"
+          - -addext
+          - "subjectAltName=IP:{{ deployment_ip }}"
+      when:
+        - npm_self_signed_enabled_effective
+        - not npm_self_signed_certificate.stat.exists or not npm_self_signed_key.stat.exists
+      no_log: true
+
+    - name: Set self-signed certificate permissions
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - path: "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.crt"
+          mode: "0644"
+        - path: "{{ npm_self_signed_certificate_directory_effective }}/monitoring-{{ deployment_ip }}.key"
+          mode: "0600"
+      when: npm_self_signed_enabled_effective
 
     ####################################################################
     # WAZUH
@@ -933,7 +1017,7 @@
 
     - name: Check NPM IP routing marker
       ansible.builtin.stat:
-        path: "{{ npm_directory }}/.ip-routing-v4-provisioned"
+        path: "{{ npm_directory }}/.ip-routing-v5-provisioned"
       register: npm_routing_marker
 
     - name: Create NPM IP routing provisioner
@@ -955,7 +1039,7 @@
 
     - name: Create NPM IP routing marker
       ansible.builtin.copy:
-        dest: "{{ npm_directory }}/.ip-routing-v4-provisioned"
+        dest: "{{ npm_directory }}/.ip-routing-v5-provisioned"
         content: "{{ deployment_ip }}\n"
         owner: root
         group: root
@@ -975,12 +1059,12 @@
 
     - name: Check Zabbix interface provisioning marker
       ansible.builtin.stat:
-        path: "{{ zabbix_directory }}/.default-agent-interface-provisioned"
+        path: "{{ zabbix_directory }}/.default-agent-interface-v5-provisioned"
       register: zabbix_interface_marker
 
-    - name: Login to Zabbix API for initial provisioning
+    - name: Try login to Zabbix API for initial interface provisioning
       ansible.builtin.uri:
-        url: http://127.0.0.1/api_jsonrpc.php
+        url: http://127.0.0.1/zabbix/api_jsonrpc.php
         method: POST
         body_format: json
         headers:
@@ -995,17 +1079,13 @@
           id: 1
         status_code: 200
       register: zabbix_login
-      retries: 60
-      delay: 5
-      until: >-
-        zabbix_login.json is defined
-        and zabbix_login.json.result is defined
+      failed_when: false
       when: not zabbix_interface_marker.stat.exists
       no_log: true
 
     - name: Read default Zabbix host interface
       ansible.builtin.uri:
-        url: http://127.0.0.1/api_jsonrpc.php
+        url: http://127.0.0.1/zabbix/api_jsonrpc.php
         method: POST
         body_format: json
         headers:
@@ -1028,14 +1108,11 @@
           id: 2
         status_code: 200
       register: zabbix_default_host
-      retries: 30
-      delay: 5
-      until: >-
-        zabbix_default_host.json is defined
-        and zabbix_default_host.json.result is defined
-        and zabbix_default_host.json.result | length > 0
-        and zabbix_default_host.json.result[0].interfaces | length > 0
-      when: not zabbix_interface_marker.stat.exists
+      failed_when: false
+      when:
+        - not zabbix_interface_marker.stat.exists
+        - zabbix_login.json is defined
+        - zabbix_login.json.result is defined
       no_log: true
 
     - name: Set default Zabbix interface identifier
@@ -1044,12 +1121,14 @@
           {{ (zabbix_default_host.json.result[0].interfaces | first).interfaceid }}
       when:
         - not zabbix_interface_marker.stat.exists
+        - zabbix_default_host.json is defined
+        - zabbix_default_host.json.result is defined
         - zabbix_default_host.json.result | length > 0
         - zabbix_default_host.json.result[0].interfaces | length > 0
 
-    - name: Configure default Zabbix host to reach Agent 2 on host
+    - name: Configure default Zabbix host to reach Agent 2 on VM address
       ansible.builtin.uri:
-        url: http://127.0.0.1/api_jsonrpc.php
+        url: http://127.0.0.1/zabbix/api_jsonrpc.php
         method: POST
         body_format: json
         headers:
@@ -1060,17 +1139,15 @@
           method: hostinterface.update
           params:
             interfaceid: "{{ zabbix_default_interface_id }}"
-            useip: 0
-            ip: ""
-            dns: host.docker.internal
+            useip: 1
+            ip: "{{ deployment_ip }}"
+            dns: ""
             port: "{{ zabbix_agent_listen_port }}"
           auth: "{{ zabbix_login.json.result }}"
           id: 3
         status_code: 200
       register: zabbix_interface_update
-      failed_when:
-        - zabbix_interface_update.json is not defined
-          or zabbix_interface_update.json.result is not defined
+      failed_when: false
       when:
         - not zabbix_interface_marker.stat.exists
         - zabbix_default_interface_id is defined
@@ -1078,14 +1155,22 @@
 
     - name: Create Zabbix interface provisioning marker
       ansible.builtin.copy:
-        dest: "{{ zabbix_directory }}/.default-agent-interface-provisioned"
-        content: "host.docker.internal:{{ zabbix_agent_listen_port }}\n"
+        dest: "{{ zabbix_directory }}/.default-agent-interface-v5-provisioned"
+        content: "{{ deployment_ip }}:{{ zabbix_agent_listen_port }}\n"
         owner: root
         group: root
         mode: "0600"
       when:
         - not zabbix_interface_marker.stat.exists
-        - zabbix_default_interface_id is defined
+        - zabbix_interface_update.json is defined
+        - zabbix_interface_update.json.result is defined
+
+    - name: Show Zabbix Agent interface reminder
+      ansible.builtin.debug:
+        msg: >-
+          Sprawdź w Zabbix Web: Data collection -> Hosts -> Zabbix server -> Interfaces.
+          Ustaw {{ deployment_ip }}:{{ zabbix_agent_listen_port }}.
+          Adres 127.0.0.1 wskazuje kontener Zabbix Server i nie połączy się z Agentem 2 na hoście.
 
     ####################################################################
     # VERIFICATION
@@ -1108,7 +1193,7 @@
 
     - name: Wait for Zabbix through Nginx Proxy Manager
       ansible.builtin.uri:
-        url: "http://127.0.0.1/"
+        url: "http://127.0.0.1/zabbix/"
         headers:
           Host: "{{ deployment_ip }}"
         status_code:
@@ -1121,6 +1206,36 @@
       delay: 10
       until: zabbix_npm_check.status in [200, 301, 302]
 
+    - name: Wait for Wazuh HTTPS through Nginx Proxy Manager
+      ansible.builtin.uri:
+        url: "https://{{ deployment_ip }}/wazuh/"
+        status_code:
+          - 200
+          - 302
+          - 401
+        validate_certs: false
+        return_content: false
+      register: wazuh_npm_https_check
+      retries: 30
+      delay: 5
+      until: wazuh_npm_https_check.status in [200, 302, 401]
+      when: npm_self_signed_enabled_effective
+
+    - name: Wait for Zabbix HTTPS through Nginx Proxy Manager
+      ansible.builtin.uri:
+        url: "https://{{ deployment_ip }}/zabbix/"
+        status_code:
+          - 200
+          - 301
+          - 302
+        validate_certs: false
+        return_content: false
+      register: zabbix_npm_https_check
+      retries: 30
+      delay: 5
+      until: zabbix_npm_https_check.status in [200, 301, 302]
+      when: npm_self_signed_enabled_effective
+
     - name: Read running containers
       ansible.builtin.command:
         cmd: docker ps --format "table {{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}"
@@ -1131,9 +1246,20 @@
       ansible.builtin.debug:
         msg:
           - "Wdrożenie zakończone."
-          - "Wazuh: http://{{ deployment_ip }}/wazuh/"
-          - "Zabbix: http://{{ deployment_ip }}/"
-          - "Zabbix alias: http://{{ deployment_ip }}/zabbix/ -> /"
+          - "Wazuh HTTP: http://{{ deployment_ip }}/wazuh/"
+          - "Zabbix HTTP: http://{{ deployment_ip }}/zabbix/"
+          - >-
+            {{
+              'Wazuh HTTPS: https://' ~ deployment_ip ~ '/wazuh/ (self-signed)'
+              if npm_self_signed_enabled_effective
+              else 'Wazuh HTTPS self-signed: wyłączony'
+            }}
+          - >-
+            {{
+              'Zabbix HTTPS: https://' ~ deployment_ip ~ '/zabbix/ (self-signed)'
+              if npm_self_signed_enabled_effective
+              else 'Zabbix HTTPS self-signed: wyłączony'
+            }}
           - "Nginx Proxy Manager: http://{{ deployment_ip }}:81"
           - "NPM login: {{ npm_admin_email }}"
           - "Wazuh agent events: {{ deployment_ip }}:1514"
@@ -1141,4 +1267,5 @@
           - "Wazuh API: https://{{ deployment_ip }}:55000"
           - "Zabbix server: {{ deployment_ip }}:10051"
           - "Zabbix Agent 2: {{ deployment_ip }}:{{ zabbix_agent_listen_port }}"
+          - "WAŻNE: w Data collection -> Hosts -> Zabbix server -> Interfaces ustaw {{ deployment_ip }}:{{ zabbix_agent_listen_port }}. Adres 127.0.0.1 wskazuje kontener Zabbix Server i nie zadziała."
           - "{{ docker_ps_result.stdout }}"

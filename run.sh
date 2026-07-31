@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 if [[ ! -f group_vars/all.yml ]]; then
   cp group_vars/all.yml.example group_vars/all.yml
   chmod 600 group_vars/all.yml
-  echo "Utworzono group_vars/all.yml. Ustaw hasła CHANGE_ME i uruchom skrypt ponownie."
+  echo "Utworzono group_vars/all.yml. Sprawdź ustawienia i uruchom skrypt ponownie."
   exit 1
 fi
 

@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 import json
+import mimetypes
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
+from pathlib import Path
 
 API = "http://127.0.0.1:81/api"
 IDENTITY = {{ npm_admin_email | to_json }}
 SECRET = {{ npm_admin_password | to_json }}
 DEPLOYMENT_IP = {{ deployment_ip | to_json }}
+SELF_SIGNED_ENABLED = {{ 'True' if npm_self_signed_enabled_effective else 'False' }}
+SELF_SIGNED_CERTIFICATE = {{ (npm_self_signed_certificate_directory_effective ~ '/monitoring-' ~ deployment_ip ~ '.crt') | to_json }}
+SELF_SIGNED_KEY = {{ (npm_self_signed_certificate_directory_effective ~ '/monitoring-' ~ deployment_ip ~ '.key') | to_json }}
+SELF_SIGNED_NAME = f"Security Monitoring self-signed {DEPLOYMENT_IP}"
+FORCE_SSL = {{ 'True' if npm_force_ssl_effective else 'False' }}
+
+
+def decode_response(response):
+    raw = response.read().decode("utf-8")
+    return json.loads(raw) if raw else None
 
 
 def request(method, path, body=None, token=None):
@@ -26,8 +40,42 @@ def request(method, path, body=None, token=None):
         method=method,
     )
     with urllib.request.urlopen(req, timeout=30) as response:
-        raw = response.read().decode("utf-8")
-        return json.loads(raw) if raw else None
+        return decode_response(response)
+
+
+def multipart_request(path, files, token):
+    boundary = f"----security-monitoring-{uuid.uuid4().hex}"
+    body = bytearray()
+
+    for field_name, file_path in files.items():
+        source = Path(file_path)
+        if not source.is_file():
+            raise FileNotFoundError(f"Brak pliku certyfikatu: {source}")
+
+        content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{field_name}"; '
+                f'filename="{source.name}"\r\n'
+            ).encode("utf-8")
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("ascii"))
+        body.extend(source.read_bytes())
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode("ascii"))
+    req = urllib.request.Request(
+        API + path,
+        data=bytes(body),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return decode_response(response)
 
 
 for attempt in range(60):
@@ -52,13 +100,69 @@ existing = next(
     None,
 )
 
-advanced_config = """location = /wazuh { return 301 /wazuh/; }
-location = /zabbix { return 302 /; }
-location = /zabbix/ { return 302 /; }
+certificate_id = 0
+certificate_source = "none"
+existing_certificate_id = int(existing.get("certificate_id", 0)) if existing else 0
+
+# Nie nadpisuj certyfikatu, który administrator podpiął później ręcznie.
+if existing_certificate_id:
+    certificate_id = existing_certificate_id
+    certificate_source = "existing"
+elif SELF_SIGNED_ENABLED:
+    certificates = request("GET", "/nginx/certificates", token=token)
+    certificate = next(
+        (item for item in certificates if item.get("nice_name") == SELF_SIGNED_NAME),
+        None,
+    )
+
+    if certificate is None:
+        certificate_files = {
+            "certificate": SELF_SIGNED_CERTIFICATE,
+            "certificate_key": SELF_SIGNED_KEY,
+        }
+        multipart_request("/nginx/certificates/validate", certificate_files, token)
+        certificate = request(
+            "POST",
+            "/nginx/certificates",
+            {
+                "provider": "other",
+                "nice_name": SELF_SIGNED_NAME,
+            },
+            token,
+        )
+        multipart_request(
+            f"/nginx/certificates/{certificate['id']}/upload",
+            certificate_files,
+            token,
+        )
+
+    certificate_id = int(certificate["id"])
+    certificate_source = "self-signed"
+
+advanced_config = """location = / { return 302 /zabbix/; }
+location = /zabbix { return 301 /zabbix/; }
+location = /wazuh { return 301 /wazuh/; }
 client_max_body_size 64m;
 """
 
+managed_paths = {"/zabbix/", "/wazuh/"}
 locations = [
+    {
+        "path": "/zabbix/",
+        "forward_scheme": "http",
+        "forward_host": "zabbix-web-nginx",
+        "forward_port": 8080,
+        # Końcowy slash usuwa prefiks /zabbix/ przed wysłaniem do oficjalnego obrazu.
+        "forward_path": "/",
+        "advanced_config": (
+            "proxy_cookie_path / /zabbix/;\n"
+            "proxy_redirect ~^https?://[^/]+/(.*)$ /zabbix/$1;\n"
+            "proxy_redirect ~^/(.*)$ /zabbix/$1;\n"
+            "proxy_set_header X-Forwarded-Prefix /zabbix;\n"
+            "proxy_read_timeout 3600s;\n"
+            "proxy_send_timeout 3600s;"
+        ),
+    },
     {
         "path": "/wazuh/",
         "forward_scheme": "http",
@@ -74,45 +178,69 @@ locations = [
     },
 ]
 
+# Zachowaj dodatkowe Custom Locations dodane ręcznie przez administratora.
+if existing:
+    locations.extend(
+        location
+        for location in existing.get("locations", [])
+        if location.get("path") not in managed_paths
+    )
+
 payload = {
     "domain_names": [DEPLOYMENT_IP],
     "forward_scheme": "http",
     "forward_host": "zabbix-web-nginx",
     "forward_port": 8080,
     "access_list_id": 0,
-    "certificate_id": 0,
-    "ssl_forced": False,
+    "certificate_id": certificate_id,
+    "ssl_forced": bool(FORCE_SSL and certificate_id),
     "caching_enabled": False,
     "block_exploits": False,
     "advanced_config": advanced_config,
     "meta": {},
     "allow_websocket_upgrade": True,
-    "http2_support": False,
+    "http2_support": bool(certificate_id),
     "hsts_enabled": False,
     "hsts_subdomains": False,
-    "trust_forwarded_proto": False,
+    "trust_forwarded_proto": True,
     "enabled": True,
     "locations": locations,
 }
 
 if existing:
-    # Zachowaj domeny i konfigurację SSL dodaną ręcznie w NPM.
-    payload["domain_names"] = list(dict.fromkeys(existing.get("domain_names", []) + [DEPLOYMENT_IP]))
-    for key in (
-        "access_list_id",
-        "certificate_id",
-        "ssl_forced",
-        "http2_support",
-        "hsts_enabled",
-        "hsts_subdomains",
-        "trust_forwarded_proto",
-    ):
+    payload["domain_names"] = list(
+        dict.fromkeys(existing.get("domain_names", []) + [DEPLOYMENT_IP])
+    )
+    for key in ("access_list_id", "hsts_enabled", "hsts_subdomains"):
         if key in existing:
             payload[key] = existing[key]
+
+    # Ręcznie dodany certyfikat i ustawienia SSL mają pierwszeństwo.
+    if existing_certificate_id:
+        for key in (
+            "certificate_id",
+            "ssl_forced",
+            "http2_support",
+            "trust_forwarded_proto",
+        ):
+            if key in existing:
+                payload[key] = existing[key]
+
     result = request("PUT", f"/nginx/proxy-hosts/{existing['id']}", payload, token)
     action = "updated"
 else:
     result = request("POST", "/nginx/proxy-hosts", payload, token)
     action = "created"
 
-print(json.dumps({"action": action, "id": result.get("id"), "ip": DEPLOYMENT_IP}))
+print(
+    json.dumps(
+        {
+            "action": action,
+            "id": result.get("id"),
+            "ip": DEPLOYMENT_IP,
+            "certificate": certificate_source,
+            "certificate_id": certificate_id,
+            "force_ssl": payload["ssl_forced"],
+        }
+    )
+)

@@ -36,6 +36,12 @@ npm_app_image: jc21/nginx-proxy-manager:2.15.0
 npm_admin_email: admin@example.com
 npm_admin_password: 'changeme'
 
+# Self-signed dla dostępu po IP. HTTPS działa równolegle z HTTP.
+npm_self_signed_enabled: true
+npm_self_signed_days: 3650
+npm_force_ssl: false
+npm_self_signed_certificate_directory: "{{ npm_directory }}/certificates"
+
 # Wazuh
 wazuh_docker_repository: https://github.com/wazuh/wazuh-docker.git
 wazuh_docker_version: v4.14.6
