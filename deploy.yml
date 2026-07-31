@@ -55,6 +55,57 @@
           ale nie wymaga cyfr ani znaków specjalnych.
       no_log: true
 
+    - name: Resolve storage mode
+      ansible.builtin.set_fact:
+        security_monitoring_data_root_effective: >-
+          {{ security_monitoring_data_root | default('/opt') | regex_replace('/+$', '') }}
+        security_monitoring_bind_persistent_data_effective: >-
+          {{ security_monitoring_bind_persistent_data | default(false) | bool }}
+
+    - name: Validate storage root
+      ansible.builtin.assert:
+        that:
+          - security_monitoring_data_root_effective is match('^/.+')
+          - security_monitoring_data_root_effective != '/'
+        fail_msg: >-
+          security_monitoring_data_root musi być bezwzględną ścieżką inną niż /.
+          Przykład: /opt albo /data/security-monitoring.
+
+    - name: Check optional required mountpoint
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --mountpoint
+          - "{{ security_monitoring_required_mountpoint }}"
+      register: security_monitoring_mountpoint_check
+      changed_when: false
+      failed_when: false
+      when: security_monitoring_required_mountpoint | default('') | length > 0
+
+    - name: Verify optional required mountpoint
+      ansible.builtin.assert:
+        that:
+          - security_monitoring_mountpoint_check.rc == 0
+        fail_msg: >-
+          Wymagany punkt montowania {{ security_monitoring_required_mountpoint }} nie jest aktywny.
+          Sprawdź findmnt i /etc/fstab przed uruchomieniem kontenerów.
+      when: security_monitoring_required_mountpoint | default('') | length > 0
+
+    - name: Resolve deployment directories
+      ansible.builtin.set_fact:
+        shared_database_directory_effective: >-
+          {{ shared_database_directory | default(security_monitoring_data_root_effective ~ '/shared-database') }}
+        npm_directory_effective: >-
+          {{ npm_directory | default(security_monitoring_data_root_effective ~ '/nginx-proxy-manager') }}
+        wazuh_directory_effective: >-
+          {{ wazuh_directory | default(security_monitoring_data_root_effective ~ '/wazuh') }}
+        wazuh_persistent_directory_effective: >-
+          {{ wazuh_persistent_directory | default(security_monitoring_data_root_effective ~ '/wazuh-persistent') }}
+        socfortress_directory_effective: >-
+          {{ socfortress_directory | default(security_monitoring_data_root_effective ~ '/wazuh-socfortress') }}
+        zabbix_directory_effective: >-
+          {{ zabbix_directory | default(security_monitoring_data_root_effective ~ '/zabbix') }}
+
     - name: Set deployment facts
       ansible.builtin.set_fact:
         deployment_ip: "{{ ansible_facts['default_ipv4']['address'] }}"
@@ -81,7 +132,7 @@
         npm_self_signed_days_effective: "{{ npm_self_signed_days | default(3650) | int }}"
         npm_force_ssl_effective: "{{ npm_force_ssl | default(false) | bool }}"
         npm_self_signed_certificate_directory_effective: >-
-          {{ npm_self_signed_certificate_directory | default(npm_directory ~ '/certificates') }}
+          {{ npm_self_signed_certificate_directory | default(npm_directory_effective ~ '/certificates') }}
 
     - name: Build Zabbix repository package URL
       ansible.builtin.set_fact:
@@ -94,6 +145,13 @@
           - "Host: {{ inventory_hostname }}"
           - "IP: {{ deployment_ip }}"
           - "System: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+          - "Katalog danych: {{ security_monitoring_data_root_effective }}"
+          - >-
+            {{
+              'Trwałe dane: katalogi hosta pod wybraną ścieżką'
+              if security_monitoring_bind_persistent_data_effective
+              else 'Trwałe dane: nazwane wolumeny Dockera (tryb zgodności)'
+            }}
           - "Wazuh: http://{{ deployment_ip }}/wazuh/"
           - "Zabbix: http://{{ deployment_ip }}/zabbix/"
           - >-
@@ -234,13 +292,58 @@
         - "{{ docker_proxy_network }}"
         - "{{ docker_database_network }}"
 
+    - name: Create security monitoring data root
+      ansible.builtin.file:
+        path: "{{ security_monitoring_data_root_effective }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Create bind-mounted persistent data directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ shared_database_directory_effective }}/data", owner: root, group: root, mode: "0750" }
+        - { path: "{{ npm_directory_effective }}/data", owner: root, group: root, mode: "0750" }
+        - { path: "{{ npm_directory_effective }}/letsencrypt", owner: root, group: root, mode: "0750" }
+        - { path: "{{ zabbix_directory_effective }}/data/alertscripts", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ zabbix_directory_effective }}/data/externalscripts", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ zabbix_directory_effective }}/data/modules", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ zabbix_directory_effective }}/data/enc", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ zabbix_directory_effective }}/data/ssh_keys", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ zabbix_directory_effective }}/data/ssl/certs", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ zabbix_directory_effective }}/data/ssl/keys", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ zabbix_directory_effective }}/data/ssl/ssl_ca", owner: '1997', group: '0', mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/api-configuration", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/etc", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/logs", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/queue", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/var-multigroups", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/integrations", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/active-response", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/agentless", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/wodles", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/filebeat-etc", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/manager/filebeat-var", owner: root, group: root, mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/indexer", owner: '1000', group: '1000', mode: "0750" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/dashboard/config", owner: '1000', group: '1000', mode: "0770" }
+        - { path: "{{ wazuh_persistent_directory_effective }}/dashboard/custom", owner: '1000', group: '1000', mode: "0770" }
+      when: security_monitoring_bind_persistent_data_effective
+      loop_control:
+        label: "{{ item.path }}"
+
     ####################################################################
     # SHARED MARIADB
     ####################################################################
 
     - name: Create shared database directory
       ansible.builtin.file:
-        path: "{{ shared_database_directory }}"
+        path: "{{ shared_database_directory_effective }}"
         state: directory
         owner: root
         group: root
@@ -249,7 +352,7 @@
     - name: Create shared database environment
       ansible.builtin.template:
         src: shared-db.env.j2
-        dest: "{{ shared_database_directory }}/.env"
+        dest: "{{ shared_database_directory_effective }}/.env"
         owner: root
         group: root
         mode: "0600"
@@ -258,7 +361,7 @@
     - name: Create shared database configuration
       ansible.builtin.template:
         src: shared-db.cnf.j2
-        dest: "{{ shared_database_directory }}/99-shared-database.cnf"
+        dest: "{{ shared_database_directory_effective }}/99-shared-database.cnf"
         owner: root
         group: root
         mode: "0644"
@@ -266,7 +369,7 @@
     - name: Create shared database Compose file
       ansible.builtin.template:
         src: shared-db-compose.yml.j2
-        dest: "{{ shared_database_directory }}/docker-compose.yml"
+        dest: "{{ shared_database_directory_effective }}/docker-compose.yml"
         owner: root
         group: root
         mode: "0640"
@@ -274,7 +377,7 @@
     - name: Create database bootstrap SQL
       ansible.builtin.template:
         src: shared-db-bootstrap.sql.j2
-        dest: "{{ shared_database_directory }}/bootstrap.sql"
+        dest: "{{ shared_database_directory_effective }}/bootstrap.sql"
         owner: root
         group: root
         mode: "0600"
@@ -283,12 +386,12 @@
     - name: Validate shared database Compose file
       ansible.builtin.command:
         cmd: docker compose config --quiet
-        chdir: "{{ shared_database_directory }}"
+        chdir: "{{ shared_database_directory_effective }}"
       changed_when: false
 
     - name: Start shared database
       community.docker.docker_compose_v2:
-        project_src: "{{ shared_database_directory }}"
+        project_src: "{{ shared_database_directory_effective }}"
         state: present
         pull: always
         remove_orphans: true
@@ -299,7 +402,7 @@
       ansible.builtin.shell:
         cmd: |
           set -euo pipefail
-          docker cp "{{ shared_database_directory }}/bootstrap.sql" shared-db:/tmp/bootstrap.sql
+          docker cp "{{ shared_database_directory_effective }}/bootstrap.sql" shared-db:/tmp/bootstrap.sql
           docker exec \
             -e MYSQL_PWD="{{ shared_database_root_password }}" \
             shared-db \
@@ -326,7 +429,7 @@
 
     - name: Remove database bootstrap SQL from host
       ansible.builtin.file:
-        path: "{{ shared_database_directory }}/bootstrap.sql"
+        path: "{{ shared_database_directory_effective }}/bootstrap.sql"
         state: absent
 
     ####################################################################
@@ -343,14 +446,17 @@
       changed_when: false
       failed_when: false
 
-    - name: Remove legacy path gateway directory
+    - name: Remove legacy path gateway directories
       ansible.builtin.file:
-        path: /opt/path-gateway
+        path: "{{ item }}"
         state: absent
+      loop:
+        - /opt/path-gateway
+        - "{{ security_monitoring_data_root_effective }}/path-gateway"
 
     - name: Create Nginx Proxy Manager directory
       ansible.builtin.file:
-        path: "{{ npm_directory }}"
+        path: "{{ npm_directory_effective }}"
         state: directory
         owner: root
         group: root
@@ -358,7 +464,7 @@
 
     - name: Create Nginx Proxy Manager default host directory
       ansible.builtin.file:
-        path: "{{ npm_directory }}/default-host"
+        path: "{{ npm_directory_effective }}/default-host"
         state: directory
         owner: root
         group: root
@@ -367,7 +473,7 @@
     - name: Create Nginx Proxy Manager environment
       ansible.builtin.template:
         src: npm.env.j2
-        dest: "{{ npm_directory }}/.env"
+        dest: "{{ npm_directory_effective }}/.env"
         owner: root
         group: root
         mode: "0600"
@@ -376,7 +482,7 @@
     - name: Create Nginx Proxy Manager Compose file
       ansible.builtin.template:
         src: npm-compose.yml.j2
-        dest: "{{ npm_directory }}/docker-compose.yml"
+        dest: "{{ npm_directory_effective }}/docker-compose.yml"
         owner: root
         group: root
         mode: "0640"
@@ -384,12 +490,12 @@
     - name: Validate Nginx Proxy Manager Compose file
       ansible.builtin.command:
         cmd: docker compose config --quiet
-        chdir: "{{ npm_directory }}"
+        chdir: "{{ npm_directory_effective }}"
       changed_when: false
 
     - name: Start Nginx Proxy Manager
       community.docker.docker_compose_v2:
-        project_src: "{{ npm_directory }}"
+        project_src: "{{ npm_directory_effective }}"
         state: present
         pull: always
         remove_orphans: true
@@ -480,7 +586,7 @@
     - name: Create default HTTPS virtual host for direct IP access
       ansible.builtin.template:
         src: npm-default-https.conf.j2
-        dest: "{{ npm_directory }}/default-host/site.conf"
+        dest: "{{ npm_directory_effective }}/default-host/site.conf"
         owner: root
         group: root
         mode: "0644"
@@ -489,7 +595,7 @@
 
     - name: Remove managed default HTTPS virtual host when disabled
       ansible.builtin.file:
-        path: "{{ npm_directory }}/default-host/site.conf"
+        path: "{{ npm_directory_effective }}/default-host/site.conf"
         state: absent
       when: not npm_self_signed_enabled_effective
       register: npm_default_https_removed
@@ -527,7 +633,7 @@
     - name: Clone Wazuh Docker repository
       ansible.builtin.git:
         repo: "{{ wazuh_docker_repository }}"
-        dest: "{{ wazuh_directory }}"
+        dest: "{{ wazuh_directory_effective }}"
         version: "{{ wazuh_docker_version }}"
         depth: 1
         force: true
@@ -535,7 +641,7 @@
 
     - name: Create persistent Wazuh Dashboard directory
       ansible.builtin.file:
-        path: "{{ wazuh_persistent_directory }}/dashboard"
+        path: "{{ wazuh_persistent_directory_effective }}/dashboard"
         state: directory
         owner: root
         group: root
@@ -543,13 +649,13 @@
 
     - name: Check persistent Wazuh Dashboard application configuration
       ansible.builtin.stat:
-        path: "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml"
+        path: "{{ wazuh_persistent_directory_effective }}/dashboard/wazuh.yml"
       register: persistent_wazuh_dashboard_config
 
     - name: Seed persistent Wazuh Dashboard application configuration
       ansible.builtin.copy:
-        src: "{{ wazuh_directory }}/single-node/config/wazuh_dashboard/wazuh.yml"
-        dest: "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml"
+        src: "{{ wazuh_directory_effective }}/single-node/config/wazuh_dashboard/wazuh.yml"
+        dest: "{{ wazuh_persistent_directory_effective }}/dashboard/wazuh.yml"
         remote_src: true
         owner: root
         group: root
@@ -558,7 +664,7 @@
 
     - name: Configure Wazuh Dashboard base path
       ansible.builtin.lineinfile:
-        path: "{{ wazuh_directory }}/single-node/config/wazuh_dashboard/opensearch_dashboards.yml"
+        path: "{{ wazuh_directory_effective }}/single-node/config/wazuh_dashboard/opensearch_dashboards.yml"
         regexp: "^{{ item.key | regex_escape }}:"
         line: "{{ item.key }}: {{ item.value }}"
         insertafter: EOF
@@ -576,20 +682,20 @@
 
     - name: Remove published Wazuh Dashboard web port
       ansible.builtin.replace:
-        path: "{{ wazuh_directory }}/single-node/docker-compose.yml"
+        path: "{{ wazuh_directory_effective }}/single-node/docker-compose.yml"
         regexp: '(?m)^    ports:\n      -\s*"?[^"\n]*:5601"?\s*\n'
         replace: ''
 
     - name: Bind Wazuh Indexer port to localhost
       ansible.builtin.lineinfile:
-        path: "{{ wazuh_directory }}/single-node/docker-compose.yml"
+        path: "{{ wazuh_directory_effective }}/single-node/docker-compose.yml"
         regexp: '^\s*-\s*"9200:9200"\s*$'
         line: '      - "127.0.0.1:9200:9200"'
 
     - name: Create Wazuh proxy override
       ansible.builtin.template:
         src: wazuh-proxy-compose.yml.j2
-        dest: "{{ wazuh_directory }}/single-node/docker-compose.proxy.yml"
+        dest: "{{ wazuh_directory_effective }}/single-node/docker-compose.proxy.yml"
         owner: root
         group: root
         mode: "0640"
@@ -601,24 +707,86 @@
           -f docker-compose.yml
           -f docker-compose.proxy.yml
           config --quiet
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       changed_when: false
+
+    - name: Pull Wazuh Manager image for bind-data initialization
+      community.docker.docker_image:
+        name: "wazuh/wazuh-manager:{{ wazuh_docker_version | regex_replace('^v', '') }}"
+        source: pull
+      when: security_monitoring_bind_persistent_data_effective
+
+    - name: Check Wazuh Manager bind-data initialization marker
+      ansible.builtin.stat:
+        path: "{{ wazuh_persistent_directory_effective }}/.manager-bind-data-v7-initialized"
+      register: wazuh_manager_bind_data_marker
+      when: security_monitoring_bind_persistent_data_effective
+
+    - name: Seed Wazuh Manager bind-mounted directories from image
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          seed_container="security-monitoring-wazuh-manager-seed"
+          image="wazuh/wazuh-manager:{{ wazuh_docker_version | regex_replace('^v', '') }}"
+
+          cleanup() {
+            docker rm -f "$seed_container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          cleanup
+          docker create --name "$seed_container" "$image" >/dev/null
+
+          seed_directory() {
+            source_path="$1"
+            destination_path="$2"
+            if ! find "$destination_path" -mindepth 1 -print -quit | grep -q .; then
+              docker cp -a "$seed_container:$source_path/." "$destination_path/"
+            fi
+          }
+
+          seed_directory /var/ossec/api/configuration "{{ wazuh_persistent_directory_effective }}/manager/api-configuration"
+          seed_directory /var/ossec/etc "{{ wazuh_persistent_directory_effective }}/manager/etc"
+          seed_directory /var/ossec/logs "{{ wazuh_persistent_directory_effective }}/manager/logs"
+          seed_directory /var/ossec/queue "{{ wazuh_persistent_directory_effective }}/manager/queue"
+          seed_directory /var/ossec/var/multigroups "{{ wazuh_persistent_directory_effective }}/manager/var-multigroups"
+          seed_directory /var/ossec/integrations "{{ wazuh_persistent_directory_effective }}/manager/integrations"
+          seed_directory /var/ossec/active-response/bin "{{ wazuh_persistent_directory_effective }}/manager/active-response"
+          seed_directory /var/ossec/agentless "{{ wazuh_persistent_directory_effective }}/manager/agentless"
+          seed_directory /var/ossec/wodles "{{ wazuh_persistent_directory_effective }}/manager/wodles"
+          seed_directory /etc/filebeat "{{ wazuh_persistent_directory_effective }}/manager/filebeat-etc"
+          seed_directory /var/lib/filebeat "{{ wazuh_persistent_directory_effective }}/manager/filebeat-var"
+        executable: /bin/bash
+      when:
+        - security_monitoring_bind_persistent_data_effective
+        - not wazuh_manager_bind_data_marker.stat.exists
+      changed_when: true
+
+    - name: Create Wazuh Manager bind-data initialization marker
+      ansible.builtin.copy:
+        dest: "{{ wazuh_persistent_directory_effective }}/.manager-bind-data-v7-initialized"
+        content: "wazuh-manager {{ wazuh_docker_version }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - security_monitoring_bind_persistent_data_effective
+        - not wazuh_manager_bind_data_marker.stat.exists
 
     - name: Check Wazuh certificates
       ansible.builtin.stat:
-        path: "{{ wazuh_directory }}/single-node/config/wazuh_indexer_ssl_certs/root-ca.pem"
+        path: "{{ wazuh_directory_effective }}/single-node/config/wazuh_indexer_ssl_certs/root-ca.pem"
       register: wazuh_root_ca
 
     - name: Generate Wazuh certificates
       ansible.builtin.command:
         cmd: docker compose -f generate-indexer-certs.yml run --rm generator
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       when: not wazuh_root_ca.stat.exists
       changed_when: true
 
     - name: Start Wazuh
       community.docker.docker_compose_v2:
-        project_src: "{{ wazuh_directory }}/single-node"
+        project_src: "{{ wazuh_directory_effective }}/single-node"
         files:
           - docker-compose.yml
           - docker-compose.proxy.yml
@@ -634,7 +802,7 @@
           -f docker-compose.yml
           -f docker-compose.proxy.yml
           ps --status running --services
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       register: wazuh_running_services
       retries: 60
       delay: 5
@@ -655,7 +823,7 @@
           chown "$owner" /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml &&
           chmod 660 /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
           '
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       changed_when: true
 
     ####################################################################
@@ -670,16 +838,16 @@
         group: root
         mode: "0755"
       loop:
-        - "{{ socfortress_directory }}"
-        - "{{ socfortress_directory }}/repository"
-        - "{{ socfortress_directory }}/rules"
-        - "{{ socfortress_directory }}/decoders"
+        - "{{ socfortress_directory_effective }}"
+        - "{{ socfortress_directory_effective }}/repository"
+        - "{{ socfortress_directory_effective }}/rules"
+        - "{{ socfortress_directory_effective }}/decoders"
       when: socfortress_rules_enabled | bool
 
     - name: Clone SOCFortress repository
       ansible.builtin.git:
         repo: "{{ socfortress_repository }}"
-        dest: "{{ socfortress_directory }}/repository"
+        dest: "{{ socfortress_directory_effective }}/repository"
         version: "{{ socfortress_repository_version }}"
         force: true
         update: true
@@ -689,7 +857,7 @@
       ansible.builtin.shell:
         cmd: |
           set -o pipefail
-          find "{{ socfortress_directory }}/repository" -type f -name '*.xml' -printf '%f\n' \
+          find "{{ socfortress_directory_effective }}/repository" -type f -name '*.xml' -printf '%f\n' \
             | sort | uniq -d
         executable: /bin/bash
       register: socfortress_duplicate_files
@@ -702,9 +870,9 @@
         cmd: |
           set -euo pipefail
 
-          repo="{{ socfortress_directory }}/repository"
-          rules="{{ socfortress_directory }}/rules"
-          decoders="{{ socfortress_directory }}/decoders"
+          repo="{{ socfortress_directory_effective }}/repository"
+          rules="{{ socfortress_directory_effective }}/rules"
+          decoders="{{ socfortress_directory_effective }}/decoders"
 
           rm -f "$rules"/*.xml "$decoders"/*.xml
 
@@ -729,9 +897,9 @@
             "$rules/900000-exclusion_rules.xml"
 
           find "$rules" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
-            > "{{ socfortress_directory }}/socfortress-rules.manifest"
+            > "{{ socfortress_directory_effective }}/socfortress-rules.manifest"
           find "$decoders" -maxdepth 1 -type f -name '*.xml' -printf '%f\n' | sort \
-            > "{{ socfortress_directory }}/socfortress-decoders.manifest"
+            > "{{ socfortress_directory_effective }}/socfortress-decoders.manifest"
         executable: /bin/bash
       changed_when: true
       when: socfortress_rules_enabled | bool
@@ -752,9 +920,9 @@
             fi
           '
 
-          docker cp "{{ socfortress_directory }}/rules/." \
+          docker cp "{{ socfortress_directory_effective }}/rules/." \
             "$container:/var/ossec/etc/rules/"
-          docker cp "{{ socfortress_directory }}/socfortress-rules.manifest" \
+          docker cp "{{ socfortress_directory_effective }}/socfortress-rules.manifest" \
             "$container:$manifest"
         executable: /bin/bash
       changed_when: true
@@ -776,9 +944,9 @@
             fi
           '
 
-          docker cp "{{ socfortress_directory }}/decoders/." \
+          docker cp "{{ socfortress_directory_effective }}/decoders/." \
             "$container:/var/ossec/etc/decoders/"
-          docker cp "{{ socfortress_directory }}/socfortress-decoders.manifest" \
+          docker cp "{{ socfortress_directory_effective }}/socfortress-decoders.manifest" \
             "$container:$manifest"
         executable: /bin/bash
       changed_when: true
@@ -875,7 +1043,7 @@
           find /var/ossec/etc/decoders -maxdepth 1 -type f -name "*.xml"
           -exec chmod 660 {} \;
           '
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       changed_when: true
 
     - name: Validate Wazuh rules and decoders
@@ -886,7 +1054,7 @@
           -f docker-compose.proxy.yml
           exec -T wazuh.manager
           /var/ossec/bin/wazuh-analysisd -t
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       changed_when: false
 
     - name: Restart Wazuh manager
@@ -896,7 +1064,7 @@
           -f docker-compose.yml
           -f docker-compose.proxy.yml
           restart wazuh.manager
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       changed_when: true
 
     - name: Wait for Wazuh manager after restart
@@ -906,7 +1074,7 @@
           -f docker-compose.yml
           -f docker-compose.proxy.yml
           ps --status running --services
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       register: wazuh_services_after_restart
       retries: 60
       delay: 5
@@ -921,7 +1089,7 @@
           -f docker-compose.proxy.yml
           exec -T wazuh.manager
           /var/ossec/bin/wazuh-analysisd -t
-        chdir: "{{ wazuh_directory }}/single-node"
+        chdir: "{{ wazuh_directory_effective }}/single-node"
       changed_when: false
 
     ####################################################################
@@ -930,7 +1098,7 @@
 
     - name: Create Zabbix directory
       ansible.builtin.file:
-        path: "{{ zabbix_directory }}"
+        path: "{{ zabbix_directory_effective }}"
         state: directory
         owner: root
         group: root
@@ -939,7 +1107,7 @@
     - name: Create Zabbix environment file
       ansible.builtin.template:
         src: zabbix.env.j2
-        dest: "{{ zabbix_directory }}/.env"
+        dest: "{{ zabbix_directory_effective }}/.env"
         owner: root
         group: root
         mode: "0600"
@@ -948,7 +1116,7 @@
     - name: Create Zabbix Compose file
       ansible.builtin.template:
         src: zabbix-compose.yml.j2
-        dest: "{{ zabbix_directory }}/docker-compose.yml"
+        dest: "{{ zabbix_directory_effective }}/docker-compose.yml"
         owner: root
         group: root
         mode: "0640"
@@ -956,13 +1124,13 @@
     - name: Validate Zabbix Compose file
       ansible.builtin.command:
         cmd: docker compose config --quiet
-        chdir: "{{ zabbix_directory }}"
+        chdir: "{{ zabbix_directory_effective }}"
       changed_when: false
 
     - name: Start Zabbix stack
       ansible.builtin.command:
         cmd: docker compose up -d --pull always --remove-orphans
-        chdir: "{{ zabbix_directory }}"
+        chdir: "{{ zabbix_directory_effective }}"
       changed_when: true
 
     - name: Wait for Zabbix web container
@@ -1066,42 +1234,33 @@
     # NPM IP ROUTING
     ####################################################################
 
-    - name: Check NPM IP routing marker
-      ansible.builtin.stat:
-        path: "{{ npm_directory }}/.ip-routing-v5-provisioned"
-      register: npm_routing_marker
+    - name: Remove obsolete NPM routing markers
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ npm_directory_effective }}/.ip-routing-v5-provisioned"
+        - "{{ npm_directory_effective }}/.ip-routing-v6-provisioned"
 
     - name: Create NPM IP routing provisioner
       ansible.builtin.template:
         src: npm-provision.py.j2
-        dest: "{{ npm_directory }}/provision-ip-routing.py"
+        dest: "{{ npm_directory_effective }}/provision-ip-routing.py"
         owner: root
         group: root
         mode: "0700"
-      when: not npm_routing_marker.stat.exists
       no_log: true
 
     - name: Provision IP routing in Nginx Proxy Manager
       ansible.builtin.command:
-        cmd: "{{ npm_directory }}/provision-ip-routing.py"
+        cmd: "{{ npm_directory_effective }}/provision-ip-routing.py"
       register: npm_routing_result
-      when: not npm_routing_marker.stat.exists
-      changed_when: true
-
-    - name: Create NPM IP routing marker
-      ansible.builtin.copy:
-        dest: "{{ npm_directory }}/.ip-routing-v5-provisioned"
-        content: "{{ deployment_ip }}\n"
-        owner: root
-        group: root
-        mode: "0600"
-      when:
-        - not npm_routing_marker.stat.exists
-        - npm_routing_result.rc == 0
+      changed_when: >-
+        (npm_routing_result.stdout | from_json).action in ['created', 'updated']
 
     - name: Remove NPM routing provisioner containing credentials
       ansible.builtin.file:
-        path: "{{ npm_directory }}/provision-ip-routing.py"
+        path: "{{ npm_directory_effective }}/provision-ip-routing.py"
         state: absent
 
     ####################################################################
@@ -1110,7 +1269,7 @@
 
     - name: Check Zabbix interface provisioning marker
       ansible.builtin.stat:
-        path: "{{ zabbix_directory }}/.default-agent-interface-v5-provisioned"
+        path: "{{ zabbix_directory_effective }}/.default-agent-interface-v5-provisioned"
       register: zabbix_interface_marker
 
     - name: Try login to Zabbix API for initial interface provisioning
@@ -1206,7 +1365,7 @@
 
     - name: Create Zabbix interface provisioning marker
       ansible.builtin.copy:
-        dest: "{{ zabbix_directory }}/.default-agent-interface-v5-provisioned"
+        dest: "{{ zabbix_directory_effective }}/.default-agent-interface-v5-provisioned"
         content: "{{ deployment_ip }}:{{ zabbix_agent_listen_port }}\n"
         owner: root
         group: root
@@ -1297,6 +1456,7 @@
       ansible.builtin.debug:
         msg:
           - "Wdrożenie zakończone."
+          - "Katalog danych: {{ security_monitoring_data_root_effective }}"
           - "Wazuh HTTP: http://{{ deployment_ip }}/wazuh/"
           - "Zabbix HTTP: http://{{ deployment_ip }}/zabbix/"
           - >-

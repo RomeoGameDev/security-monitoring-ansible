@@ -17,7 +17,15 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - zabbix_alertscripts:/usr/lib/zabbix/alertscripts
+{% if security_monitoring_bind_persistent_data_effective %}      - "{{ zabbix_directory_effective }}/data/alertscripts:/usr/lib/zabbix/alertscripts"
+      - "{{ zabbix_directory_effective }}/data/externalscripts:/usr/lib/zabbix/externalscripts"
+      - "{{ zabbix_directory_effective }}/data/modules:/var/lib/zabbix/modules"
+      - "{{ zabbix_directory_effective }}/data/enc:/var/lib/zabbix/enc"
+      - "{{ zabbix_directory_effective }}/data/ssh_keys:/var/lib/zabbix/ssh_keys"
+      - "{{ zabbix_directory_effective }}/data/ssl/certs:/var/lib/zabbix/ssl/certs"
+      - "{{ zabbix_directory_effective }}/data/ssl/keys:/var/lib/zabbix/ssl/keys"
+      - "{{ zabbix_directory_effective }}/data/ssl/ssl_ca:/var/lib/zabbix/ssl/ssl_ca"
+{% else %}      - zabbix_alertscripts:/usr/lib/zabbix/alertscripts
       - zabbix_externalscripts:/usr/lib/zabbix/externalscripts
       - zabbix_modules:/var/lib/zabbix/modules
       - zabbix_enc:/var/lib/zabbix/enc
@@ -25,7 +33,7 @@ services:
       - zabbix_ssl_certs:/var/lib/zabbix/ssl/certs
       - zabbix_ssl_keys:/var/lib/zabbix/ssl/keys
       - zabbix_ssl_ca:/var/lib/zabbix/ssl/ssl_ca
-    networks:
+{% endif %}    networks:
       - database
       - zabbix_internal
 
@@ -54,7 +62,7 @@ services:
         aliases:
           - zabbix-web-nginx
 
-volumes:
+{% if not security_monitoring_bind_persistent_data_effective %}volumes:
   zabbix_alertscripts:
     name: zabbix_alertscripts
   zabbix_externalscripts:
@@ -72,7 +80,7 @@ volumes:
   zabbix_ssl_ca:
     name: zabbix_ssl_ca
 
-networks:
+{% endif %}networks:
   zabbix_internal:
     name: zabbix_internal
   database:

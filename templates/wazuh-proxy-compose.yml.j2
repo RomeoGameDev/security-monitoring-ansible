@@ -1,7 +1,27 @@
 services:
-  wazuh.dashboard:
+{% if security_monitoring_bind_persistent_data_effective %}  wazuh.manager:
     volumes:
-      - "{{ wazuh_persistent_directory }}/dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml:rw"
+      - "{{ wazuh_persistent_directory_effective }}/manager/api-configuration:/var/ossec/api/configuration"
+      - "{{ wazuh_persistent_directory_effective }}/manager/etc:/var/ossec/etc"
+      - "{{ wazuh_persistent_directory_effective }}/manager/logs:/var/ossec/logs"
+      - "{{ wazuh_persistent_directory_effective }}/manager/queue:/var/ossec/queue"
+      - "{{ wazuh_persistent_directory_effective }}/manager/var-multigroups:/var/ossec/var/multigroups"
+      - "{{ wazuh_persistent_directory_effective }}/manager/integrations:/var/ossec/integrations"
+      - "{{ wazuh_persistent_directory_effective }}/manager/active-response:/var/ossec/active-response/bin"
+      - "{{ wazuh_persistent_directory_effective }}/manager/agentless:/var/ossec/agentless"
+      - "{{ wazuh_persistent_directory_effective }}/manager/wodles:/var/ossec/wodles"
+      - "{{ wazuh_persistent_directory_effective }}/manager/filebeat-etc:/etc/filebeat"
+      - "{{ wazuh_persistent_directory_effective }}/manager/filebeat-var:/var/lib/filebeat"
+
+  wazuh.indexer:
+    volumes:
+      - "{{ wazuh_persistent_directory_effective }}/indexer:/var/lib/wazuh-indexer"
+
+{% endif %}  wazuh.dashboard:
+    volumes:
+{% if security_monitoring_bind_persistent_data_effective %}      - "{{ wazuh_persistent_directory_effective }}/dashboard/config:/usr/share/wazuh-dashboard/data/wazuh/config"
+      - "{{ wazuh_persistent_directory_effective }}/dashboard/custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom"
+{% endif %}      - "{{ wazuh_persistent_directory_effective }}/dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml:rw"
     networks:
       default:
       proxy:

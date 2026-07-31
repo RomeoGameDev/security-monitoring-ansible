@@ -20,21 +20,23 @@ services:
       INITIAL_ADMIN_PASSWORD: "${INITIAL_ADMIN_PASSWORD}"
       DISABLE_IPV6: "true"
     volumes:
-      - npm_data:/data
+{% if security_monitoring_bind_persistent_data_effective %}      - "{{ npm_directory_effective }}/data:/data"
+      - "{{ npm_directory_effective }}/letsencrypt:/etc/letsencrypt"
+{% else %}      - npm_data:/data
       - npm_letsencrypt:/etc/letsencrypt
-      - "{{ npm_directory }}/default-host:/data/nginx/default_host"
+{% endif %}      - "{{ npm_directory_effective }}/default-host:/data/nginx/default_host"
 {% if npm_self_signed_enabled_effective %}      - "{{ npm_self_signed_certificate_directory_effective }}:/data/ip-certificates:ro"
 {% endif %}    networks:
       - proxy
       - database
 
-volumes:
+{% if not security_monitoring_bind_persistent_data_effective %}volumes:
   npm_data:
     name: npm_data
   npm_letsencrypt:
     name: npm_letsencrypt
 
-networks:
+{% endif %}networks:
   proxy:
     external: true
     name: "{{ docker_proxy_network }}"

@@ -4,17 +4,23 @@ timezone: Europe/Warsaw
 # Zatrzymuje lokalne nginx/apache2, jeśli zajmują porty 80/443.
 disable_conflicting_web_services: true
 
+# Główny katalog wdrożenia i danych aplikacyjnych.
+# Domyślnie zachowuje układ /opt/....
+# Dla osobnego dysku można ustawić np. /data/security-monitoring.
+security_monitoring_data_root: /opt
+
+# Opcjonalna blokada przed zapisem na partycji systemowej, gdy dysk /data nie jest zamontowany.
+# Dla security_monitoring_data_root: /data/security-monitoring ustaw: /data
+security_monitoring_required_mountpoint: ''
+
+# true: trwałe dane usług są bind-mountami pod powyższą ścieżką.
+# false: dane pozostają w nazwanych wolumenach Dockera pod Docker data-root.
+# Na istniejącej instalacji nie przełączaj false -> true bez migracji danych.
+security_monitoring_bind_persistent_data: true
+
 # Sieci Docker
 docker_proxy_network: proxy
 docker_database_network: database
-
-# Katalogi wdrożenia
-shared_database_directory: /opt/shared-database
-npm_directory: /opt/nginx-proxy-manager
-wazuh_directory: /opt/wazuh
-wazuh_persistent_directory: /opt/wazuh-persistent
-socfortress_directory: /opt/wazuh-socfortress
-zabbix_directory: /opt/zabbix
 
 # Wspólna MariaDB dla NPM i Zabbixa
 # Poniższe hasła są domyślne dla środowiska testowego.
@@ -40,7 +46,6 @@ npm_admin_password: 'changeme'
 npm_self_signed_enabled: true
 npm_self_signed_days: 3650
 npm_force_ssl: false
-npm_self_signed_certificate_directory: "{{ npm_directory }}/certificates"
 
 # Wazuh
 wazuh_docker_repository: https://github.com/wazuh/wazuh-docker.git

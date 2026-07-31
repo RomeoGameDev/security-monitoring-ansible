@@ -9,8 +9,9 @@ services:
       MARIADB_ROOT_PASSWORD: "${MARIADB_ROOT_PASSWORD}"
       MARIADB_AUTO_UPGRADE: "1"
     volumes:
-      - shared_db_data:/var/lib/mysql
-      - ./99-shared-database.cnf:/etc/mysql/conf.d/99-shared-database.cnf:ro
+{% if security_monitoring_bind_persistent_data_effective %}      - "{{ shared_database_directory_effective }}/data:/var/lib/mysql"
+{% else %}      - shared_db_data:/var/lib/mysql
+{% endif %}      - ./99-shared-database.cnf:/etc/mysql/conf.d/99-shared-database.cnf:ro
     networks:
       database:
         aliases:
@@ -26,11 +27,11 @@ services:
       retries: 30
       start_period: 40s
 
-volumes:
+{% if not security_monitoring_bind_persistent_data_effective %}volumes:
   shared_db_data:
     name: shared_db_data
 
-networks:
+{% endif %}networks:
   database:
     external: true
     name: "{{ docker_database_network }}"

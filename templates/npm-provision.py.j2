@@ -226,8 +226,51 @@ if existing:
             if key in existing:
                 payload[key] = existing[key]
 
-    result = request("PUT", f"/nginx/proxy-hosts/{existing['id']}", payload, token)
-    action = "updated"
+    compare_keys = (
+        "domain_names",
+        "forward_scheme",
+        "forward_host",
+        "forward_port",
+        "access_list_id",
+        "certificate_id",
+        "ssl_forced",
+        "caching_enabled",
+        "block_exploits",
+        "advanced_config",
+        "allow_websocket_upgrade",
+        "http2_support",
+        "hsts_enabled",
+        "hsts_subdomains",
+        "trust_forwarded_proto",
+        "enabled",
+    )
+
+    def normalized_locations(items):
+        keys = (
+            "path",
+            "forward_scheme",
+            "forward_host",
+            "forward_port",
+            "forward_path",
+            "advanced_config",
+        )
+        return sorted(
+            ({key: item.get(key, "") for key in keys} for item in items),
+            key=lambda item: item["path"],
+        )
+
+    needs_update = any(existing.get(key) != payload.get(key) for key in compare_keys)
+    needs_update = needs_update or (
+        normalized_locations(existing.get("locations", []))
+        != normalized_locations(payload.get("locations", []))
+    )
+
+    if needs_update:
+        result = request("PUT", f"/nginx/proxy-hosts/{existing['id']}", payload, token)
+        action = "updated"
+    else:
+        result = existing
+        action = "unchanged"
 else:
     result = request("POST", "/nginx/proxy-hosts", payload, token)
     action = "created"
