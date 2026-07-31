@@ -716,66 +716,11 @@
         chdir: "{{ wazuh_directory_effective }}/single-node"
       changed_when: false
 
-    - name: Pull Wazuh Manager image for bind-data initialization
-      community.docker.docker_image:
-        name: "wazuh/wazuh-manager:{{ wazuh_docker_version | regex_replace('^v', '') }}"
-        source: pull
-      when: security_monitoring_bind_persistent_data_effective
-
-    - name: Check Wazuh Manager bind-data initialization marker
-      ansible.builtin.stat:
+    - name: Remove legacy Wazuh Manager bind-data initialization marker
+      ansible.builtin.file:
         path: "{{ wazuh_persistent_directory_effective }}/.manager-bind-data-v7-initialized"
-      register: wazuh_manager_bind_data_marker
+        state: absent
       when: security_monitoring_bind_persistent_data_effective
-
-    - name: Seed Wazuh Manager bind-mounted directories from image
-      ansible.builtin.shell:
-        cmd: |
-          set -euo pipefail
-          seed_container="security-monitoring-wazuh-manager-seed"
-          image="wazuh/wazuh-manager:{{ wazuh_docker_version | regex_replace('^v', '') }}"
-
-          cleanup() {
-            docker rm -f "$seed_container" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          cleanup
-          docker create --name "$seed_container" "$image" >/dev/null
-
-          seed_directory() {
-            source_path="$1"
-            destination_path="$2"
-            if ! find "$destination_path" -mindepth 1 -print -quit | grep -q .; then
-              docker cp -a "$seed_container:$source_path/." "$destination_path/"
-            fi
-          }
-
-          seed_directory /var/ossec/api/configuration "{{ wazuh_persistent_directory_effective }}/manager/api-configuration"
-          seed_directory /var/ossec/etc "{{ wazuh_persistent_directory_effective }}/manager/etc"
-          seed_directory /var/ossec/logs "{{ wazuh_persistent_directory_effective }}/manager/logs"
-          seed_directory /var/ossec/queue "{{ wazuh_persistent_directory_effective }}/manager/queue"
-          seed_directory /var/ossec/var/multigroups "{{ wazuh_persistent_directory_effective }}/manager/var-multigroups"
-          seed_directory /var/ossec/integrations "{{ wazuh_persistent_directory_effective }}/manager/integrations"
-          seed_directory /var/ossec/active-response/bin "{{ wazuh_persistent_directory_effective }}/manager/active-response"
-          seed_directory /var/ossec/agentless "{{ wazuh_persistent_directory_effective }}/manager/agentless"
-          seed_directory /var/ossec/wodles "{{ wazuh_persistent_directory_effective }}/manager/wodles"
-          seed_directory /etc/filebeat "{{ wazuh_persistent_directory_effective }}/manager/filebeat-etc"
-        executable: /bin/bash
-      when:
-        - security_monitoring_bind_persistent_data_effective
-        - not wazuh_manager_bind_data_marker.stat.exists
-      changed_when: true
-
-    - name: Create Wazuh Manager bind-data initialization marker
-      ansible.builtin.copy:
-        dest: "{{ wazuh_persistent_directory_effective }}/.manager-bind-data-v7-initialized"
-        content: "wazuh-manager {{ wazuh_docker_version }}\n"
-        owner: root
-        group: root
-        mode: "0600"
-      when:
-        - security_monitoring_bind_persistent_data_effective
-        - not wazuh_manager_bind_data_marker.stat.exists
 
     - name: Check Wazuh certificates
       ansible.builtin.stat:

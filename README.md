@@ -1,8 +1,8 @@
-# Security Monitoring Ansible V8
+# Security Monitoring Ansible V8.2
 
 Automatyczne wdrożenie na Ubuntu 24.04+ lub Debianie 13+: Wazuh 4.14.6, reguły SOCFortress, Zabbix 7.0 LTS, Zabbix Agent 2 na hoście, Nginx Proxy Manager oraz wspólna MariaDB.
 
-## Najważniejsze zmiany V8
+## Najważniejsze zmiany V8.2
 
 - `run.sh` przyjmuje prosty parametr katalogu danych,
 - `run.sh` może wyłączyć zarządzany certyfikat self-signed,
@@ -10,6 +10,7 @@ Automatyczne wdrożenie na Ubuntu 24.04+ lub Debianie 13+: Wazuh 4.14.6, reguły
 - usunięto obowiązek używania `security_monitoring_required_mountpoint`,
 - wyłączenie self-signed bezpiecznie usuwa zarządzany domyślny vhost HTTPS,
 - provisioner NPM nadal działa przy każdym wdrożeniu i jest idempotentny.
+- poprawiono inicjalizację bind-mountów Wazuh Managera: pusty katalog stanu Filebeat nie jest kopiowany z obrazu.
 
 ## Najprostsze uruchomienie
 
@@ -128,3 +129,9 @@ sudo ./cleanup_fresh.sh
 ```
 
 Ponieważ `run.sh -d` zapisuje ścieżkę w `group_vars/all.yml`, skrypt czyszczący odczyta właściwy katalog.
+
+
+## Wazuh i katalogi bind-mount
+
+Puste katalogi trwałe Wazuh Managera są inicjalizowane przez oficjalny skrypt startowy obrazu Wazuh.
+Playbook nie kopiuje już ręcznie zawartości `/var/ossec`, dzięki czemu nie dubluje mechanizmu obrazu i nie tworzy niepełnego `ossec.conf`.
