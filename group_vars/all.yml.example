@@ -17,27 +17,28 @@ socfortress_directory: /opt/wazuh-socfortress
 zabbix_directory: /opt/zabbix
 
 # Wspólna MariaDB dla NPM i Zabbixa
+# Poniższe hasła są domyślne dla środowiska testowego.
 shared_database_image: mariadb:11.4
-shared_database_root_password: 'CHANGE_ME_SHARED_DB_ROOT'
+shared_database_root_password: 'rootpassword'
 
 npm_database_name: npm
 npm_database_user: npm
-npm_database_password: 'CHANGE_ME_NPM_DB'
+npm_database_password: 'npmpassword'
 
 zabbix_database_name: zabbix
 zabbix_database_user: zabbix
-zabbix_database_password: 'CHANGE_ME_ZABBIX_DB'
+zabbix_database_password: 'zabbixpassword'
 
 # Nginx Proxy Manager
 # Wersja przypięta, żeby provisioning API był powtarzalny.
+# NPM wymaga minimum 8 znaków, ale nie wymaga znaków specjalnych.
 npm_app_image: jc21/nginx-proxy-manager:2.15.0
 npm_admin_email: admin@example.com
-npm_admin_password: 'CHANGE_ME_NPM_ADMIN'
+npm_admin_password: 'changeme'
 
 # Wazuh
 wazuh_docker_repository: https://github.com/wazuh/wazuh-docker.git
 wazuh_docker_version: v4.14.6
-wazuh_dashboard_local_port: 8443
 
 # SOCFortress
 socfortress_rules_enabled: true
@@ -50,7 +51,7 @@ custom_wazuh_decoders_source: "{{ playbook_dir }}/files/wazuh/custom_decoders"
 
 # Zabbix 7.0 LTS
 zabbix_server_image: zabbix/zabbix-server-mysql:alpine-7.0-latest
-zabbix_web_base_image: zabbix/zabbix-web-nginx-mysql:alpine-7.0-latest
+zabbix_web_image: zabbix/zabbix-web-nginx-mysql:alpine-7.0-latest
 zabbix_server_name: Zabbix Security Monitoring
 zabbix_initial_admin_user: Admin
 zabbix_initial_admin_password: zabbix

@@ -23,14 +23,15 @@
           Wykryto {{ ansible_facts["distribution"] }}
           {{ ansible_facts["distribution_version"] }}.
 
-    - name: Validate passwords and required secrets
+    - name: Validate database passwords
       ansible.builtin.assert:
         that:
           - item.value is not match('^CHANGE_ME')
-          - item.value is match('^[A-Za-z0-9_.@!#%+=:-]{12,64}$')
+          - item.value is match('^[A-Za-z0-9_.@!#%+=:-]{1,128}$')
         fail_msg: >-
-          Zmień {{ item.name }} w group_vars/all.yml.
-          Użyj 12-64 znaków: litery, cyfry oraz _ . @ ! # % + = : -
+          Ustaw {{ item.name }} w group_vars/all.yml.
+          Hasło może mieć 1-128 znaków. Znaki specjalne nie są wymagane.
+          Obsługiwane są litery, cyfry oraz _ . @ ! # % + = : -
       loop:
         - name: shared_database_root_password
           value: "{{ shared_database_root_password }}"
@@ -38,10 +39,20 @@
           value: "{{ npm_database_password }}"
         - name: zabbix_database_password
           value: "{{ zabbix_database_password }}"
-        - name: npm_admin_password
-          value: "{{ npm_admin_password }}"
       loop_control:
         label: "{{ item.name }}"
+      no_log: true
+
+    - name: Validate Nginx Proxy Manager admin password
+      ansible.builtin.assert:
+        that:
+          - npm_admin_password is not match('^CHANGE_ME')
+          - npm_admin_password | string | length >= 8
+          - npm_admin_password | string | length <= 64
+        fail_msg: >-
+          Ustaw npm_admin_password w group_vars/all.yml.
+          Nginx Proxy Manager wymaga hasła o długości 8-64 znaków,
+          ale nie wymaga cyfr ani znaków specjalnych.
       no_log: true
 
     - name: Set deployment facts
@@ -76,7 +87,8 @@
           - "IP: {{ deployment_ip }}"
           - "System: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
           - "Wazuh: http://{{ deployment_ip }}/wazuh/"
-          - "Zabbix: http://{{ deployment_ip }}/zabbix/"
+          - "Zabbix: http://{{ deployment_ip }}/"
+          - "Zabbix alias: http://{{ deployment_ip }}/zabbix/ -> /"
 
   tasks:
     ####################################################################
@@ -427,11 +439,11 @@
       loop_control:
         label: "{{ item.key }}"
 
-    - name: Bind Wazuh Dashboard diagnostics port to localhost
-      ansible.builtin.lineinfile:
+    - name: Remove published Wazuh Dashboard web port
+      ansible.builtin.replace:
         path: "{{ wazuh_directory }}/single-node/docker-compose.yml"
-        regexp: '^\s*-\s*443:5601\s*$'
-        line: '      - "127.0.0.1:{{ wazuh_dashboard_local_port }}:5601"'
+        regexp: '(?m)^    ports:\n      -\s*"?[^"\n]*:5601"?\s*\n'
+        replace: ''
 
     - name: Bind Wazuh Indexer port to localhost
       ansible.builtin.lineinfile:
@@ -798,14 +810,6 @@
         mode: "0600"
       no_log: true
 
-    - name: Create Zabbix web image Dockerfile
-      ansible.builtin.template:
-        src: zabbix-web.Dockerfile.j2
-        dest: "{{ zabbix_directory }}/Dockerfile.web"
-        owner: root
-        group: root
-        mode: "0644"
-
     - name: Create Zabbix Compose file
       ansible.builtin.template:
         src: zabbix-compose.yml.j2
@@ -822,29 +826,21 @@
 
     - name: Start Zabbix stack
       ansible.builtin.command:
-        cmd: docker compose up -d --build --pull always --remove-orphans
+        cmd: docker compose up -d --pull always --remove-orphans
         chdir: "{{ zabbix_directory }}"
       changed_when: true
 
-    - name: Wait for Zabbix API
-      ansible.builtin.uri:
-        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
-        method: POST
-        body_format: json
-        headers:
-          Content-Type: application/json-rpc
-        body:
-          jsonrpc: "2.0"
-          method: apiinfo.version
-          params: []
-          id: 1
-        status_code: 200
-      register: zabbix_api_health
+    - name: Wait for Zabbix web container
+      ansible.builtin.command:
+        cmd: >-
+          docker inspect
+          --format '{{ '{{' }}.State.Health.Status{{ '}}' }}'
+          zabbix-web-nginx
+      register: zabbix_web_health
       retries: 90
       delay: 5
-      until: >-
-        zabbix_api_health.json is defined
-        and zabbix_api_health.json.result is defined
+      until: zabbix_web_health.stdout | trim == "healthy"
+      changed_when: false
 
     ####################################################################
     # ZABBIX AGENT 2 ON HOST
@@ -932,6 +928,48 @@
       when: zabbix_agent2_enabled | bool
 
     ####################################################################
+    # NPM IP ROUTING
+    ####################################################################
+
+    - name: Check NPM IP routing marker
+      ansible.builtin.stat:
+        path: "{{ npm_directory }}/.ip-routing-v4-provisioned"
+      register: npm_routing_marker
+
+    - name: Create NPM IP routing provisioner
+      ansible.builtin.template:
+        src: npm-provision.py.j2
+        dest: "{{ npm_directory }}/provision-ip-routing.py"
+        owner: root
+        group: root
+        mode: "0700"
+      when: not npm_routing_marker.stat.exists
+      no_log: true
+
+    - name: Provision IP routing in Nginx Proxy Manager
+      ansible.builtin.command:
+        cmd: "{{ npm_directory }}/provision-ip-routing.py"
+      register: npm_routing_result
+      when: not npm_routing_marker.stat.exists
+      changed_when: true
+
+    - name: Create NPM IP routing marker
+      ansible.builtin.copy:
+        dest: "{{ npm_directory }}/.ip-routing-v4-provisioned"
+        content: "{{ deployment_ip }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - not npm_routing_marker.stat.exists
+        - npm_routing_result.rc == 0
+
+    - name: Remove NPM routing provisioner containing credentials
+      ansible.builtin.file:
+        path: "{{ npm_directory }}/provision-ip-routing.py"
+        state: absent
+
+    ####################################################################
     # INITIAL ZABBIX HOST INTERFACE
     ####################################################################
 
@@ -942,10 +980,11 @@
 
     - name: Login to Zabbix API for initial provisioning
       ansible.builtin.uri:
-        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
+        url: http://127.0.0.1/api_jsonrpc.php
         method: POST
         body_format: json
         headers:
+          Host: "{{ deployment_ip }}"
           Content-Type: application/json-rpc
         body:
           jsonrpc: "2.0"
@@ -966,10 +1005,11 @@
 
     - name: Read default Zabbix host interface
       ansible.builtin.uri:
-        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
+        url: http://127.0.0.1/api_jsonrpc.php
         method: POST
         body_format: json
         headers:
+          Host: "{{ deployment_ip }}"
           Content-Type: application/json-rpc
         body:
           jsonrpc: "2.0"
@@ -1009,10 +1049,11 @@
 
     - name: Configure default Zabbix host to reach Agent 2 on host
       ansible.builtin.uri:
-        url: http://127.0.0.1:8081/zabbix/api_jsonrpc.php
+        url: http://127.0.0.1/api_jsonrpc.php
         method: POST
         body_format: json
         headers:
+          Host: "{{ deployment_ip }}"
           Content-Type: application/json-rpc
         body:
           jsonrpc: "2.0"
@@ -1047,48 +1088,6 @@
         - zabbix_default_interface_id is defined
 
     ####################################################################
-    # NPM IP ROUTING
-    ####################################################################
-
-    - name: Check NPM IP routing marker
-      ansible.builtin.stat:
-        path: "{{ npm_directory }}/.ip-routing-provisioned"
-      register: npm_routing_marker
-
-    - name: Create NPM IP routing provisioner
-      ansible.builtin.template:
-        src: npm-provision.py.j2
-        dest: "{{ npm_directory }}/provision-ip-routing.py"
-        owner: root
-        group: root
-        mode: "0700"
-      when: not npm_routing_marker.stat.exists
-      no_log: true
-
-    - name: Provision IP routing in Nginx Proxy Manager
-      ansible.builtin.command:
-        cmd: "{{ npm_directory }}/provision-ip-routing.py"
-      register: npm_routing_result
-      when: not npm_routing_marker.stat.exists
-      changed_when: true
-
-    - name: Create NPM IP routing marker
-      ansible.builtin.copy:
-        dest: "{{ npm_directory }}/.ip-routing-provisioned"
-        content: "{{ deployment_ip }}\n"
-        owner: root
-        group: root
-        mode: "0600"
-      when:
-        - not npm_routing_marker.stat.exists
-        - npm_routing_result.rc == 0
-
-    - name: Remove NPM routing provisioner containing credentials
-      ansible.builtin.file:
-        path: "{{ npm_directory }}/provision-ip-routing.py"
-        state: absent
-
-    ####################################################################
     # VERIFICATION
     ####################################################################
 
@@ -1109,7 +1108,7 @@
 
     - name: Wait for Zabbix through Nginx Proxy Manager
       ansible.builtin.uri:
-        url: "http://127.0.0.1/zabbix/"
+        url: "http://127.0.0.1/"
         headers:
           Host: "{{ deployment_ip }}"
         status_code:
@@ -1133,7 +1132,8 @@
         msg:
           - "Wdrożenie zakończone."
           - "Wazuh: http://{{ deployment_ip }}/wazuh/"
-          - "Zabbix: http://{{ deployment_ip }}/zabbix/"
+          - "Zabbix: http://{{ deployment_ip }}/"
+          - "Zabbix alias: http://{{ deployment_ip }}/zabbix/ -> /"
           - "Nginx Proxy Manager: http://{{ deployment_ip }}:81"
           - "NPM login: {{ npm_admin_email }}"
           - "Wazuh agent events: {{ deployment_ip }}:1514"

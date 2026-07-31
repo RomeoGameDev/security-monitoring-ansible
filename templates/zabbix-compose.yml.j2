@@ -29,15 +29,11 @@ services:
       - database
       - zabbix_internal
 
-  zabbix-web:
-    build:
-      context: .
-      dockerfile: Dockerfile.web
-      args:
-        ZABBIX_WEB_BASE_IMAGE: "{{ zabbix_web_base_image }}"
-    image: local/zabbix-web-nginx-subpath:7.0
-    container_name: zabbix-web
+  zabbix-web-nginx:
+    image: "{{ zabbix_web_image }}"
+    container_name: zabbix-web-nginx
     restart: unless-stopped
+    init: true
     env_file:
       - .env
     environment:
@@ -51,14 +47,12 @@ services:
       PHP_TZ: "{{ timezone }}"
       ZBX_SERVER_NAME: "{{ zabbix_server_name }}"
       ENABLE_WEB_ACCESS_LOG: "true"
-    ports:
-      - "127.0.0.1:8081:8080"
     networks:
       zabbix_internal:
       database:
       proxy:
         aliases:
-          - zabbix-web
+          - zabbix-web-nginx
 
 volumes:
   zabbix_alertscripts:

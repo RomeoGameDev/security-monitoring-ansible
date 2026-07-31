@@ -52,9 +52,9 @@ existing = next(
     None,
 )
 
-advanced_config = """location = / { return 302 /wazuh/; }
-location = /wazuh { return 301 /wazuh/; }
-location = /zabbix { return 301 /zabbix/; }
+advanced_config = """location = /wazuh { return 301 /wazuh/; }
+location = /zabbix { return 302 /; }
+location = /zabbix/ { return 302 /; }
 client_max_body_size 64m;
 """
 
@@ -72,25 +72,13 @@ locations = [
             "proxy_set_header X-Forwarded-Prefix /wazuh;"
         ),
     },
-    {
-        "path": "/zabbix/",
-        "forward_scheme": "http",
-        "forward_host": "zabbix-web",
-        "forward_port": 8080,
-        "forward_path": "",
-        "advanced_config": (
-            "proxy_read_timeout 300s;\n"
-            "proxy_set_header X-Forwarded-Prefix /zabbix;\n"
-            "proxy_cookie_path / /zabbix/;"
-        ),
-    },
 ]
 
 payload = {
     "domain_names": [DEPLOYMENT_IP],
     "forward_scheme": "http",
-    "forward_host": "wazuh-dashboard",
-    "forward_port": 5601,
+    "forward_host": "zabbix-web-nginx",
+    "forward_port": 8080,
     "access_list_id": 0,
     "certificate_id": 0,
     "ssl_forced": False,

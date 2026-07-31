@@ -23,8 +23,9 @@ MariaDB
 └── baza zabbix
 
 Nginx Proxy Manager
-├── /wazuh/  -> wazuh-dashboard:5601
-└── /zabbix/ -> zabbix-web:8080
+├── /         -> zabbix-web-nginx:8080
+├── /zabbix/  -> przekierowanie do /
+└── /wazuh/   -> wazuh-dashboard:5601
 ```
 
 Kontenery:
@@ -36,7 +37,7 @@ wazuh-manager
 wazuh-indexer
 wazuh-dashboard
 zabbix-server
-zabbix-web
+zabbix-web-nginx
 ```
 
 Zabbix Agent 2 działa jako usługa systemowa na hoście.
@@ -59,11 +60,15 @@ nano group_vars/all.yml
 
 `group_vars/all.yml` jest wpisany do `.gitignore`.
 
-Zmień wszystkie wartości `CHANGE_ME`. Hasła mogą zawierać litery, cyfry oraz:
+Plik zawiera proste hasła domyślne przeznaczone do testów. Nie trzeba dodawać znaków specjalnych.
+
+Dla haseł baz danych dozwolone jest 1-128 znaków: litery, cyfry oraz:
 
 ```text
 _ . @ ! # % + = : -
 ```
+
+Hasło administratora NPM może być dowolnym tekstem o długości 8-64 znaków. Jest to minimalne ograniczenie samego Nginx Proxy Managera.
 
 ## Pierwsze uruchomienie
 
@@ -83,12 +88,39 @@ chmod +x run.sh cleanup_fresh.sh
 ## Adresy
 
 ```text
-Wazuh:               http://IP/wazuh/
-Zabbix:               http://IP/zabbix/
+Zabbix:               http://IP/
+Zabbix alias:         http://IP/zabbix/  (przekierowanie do /)
+Wazuh:                http://IP/wazuh/
 Nginx Proxy Manager:  http://IP:81
 ```
 
-NPM tworzy przy pierwszym uruchomieniu Proxy Host dla adresu IP i dwie Custom Locations. Provisioning korzysta z oficjalnych endpointów API NPM i jest wykonywany tylko raz.
+## Domyślne dane logowania
+
+```text
+Wazuh:
+  login: admin
+  hasło: SecretPassword
+
+Zabbix:
+  login: Admin
+  hasło: zabbix
+
+Nginx Proxy Manager:
+  login: admin@example.com
+  hasło: changeme
+```
+
+Domyślne hasła baz danych, używane wewnętrznie przez kontenery:
+
+```text
+MariaDB root: rootpassword
+NPM DB:       npmpassword
+Zabbix DB:    zabbixpassword
+```
+
+Są to dane do laboratorium i testów. W środowisku docelowym zmień je przed pierwszym uruchomieniem.
+
+NPM tworzy przy pierwszym uruchomieniu Proxy Host dla adresu IP. Głównym backendem jest oficjalny frontend Zabbixa `zabbix-web-nginx:8080`, a Custom Location `/wazuh/` kieruje do `wazuh-dashboard:5601`. Ścieżka `/zabbix/` przekierowuje do `/`. Provisioning korzysta z endpointów API NPM i jest wykonywany tylko raz dla danej wersji konfiguracji.
 
 Dane NPM są ustawione w:
 
@@ -108,8 +140,26 @@ Po pierwszym logowaniu możesz w tym samym Proxy Hoście dodać nazwę domenową
 Playbook nie nadpisuje późniejszych zmian, ponieważ tworzy marker:
 
 ```text
-/opt/nginx-proxy-manager/.ip-routing-provisioned
+/opt/nginx-proxy-manager/.ip-routing-v4-provisioned
 ```
+
+## Dostęp do paneli WWW
+
+Frontend Zabbixa i Wazuh Dashboard nie publikują portów WWW na interfejsach hosta. Oba kontenery są osiągalne przez nazwę DNS wyłącznie w sieci Docker `proxy`, a publiczne porty 80 i 443 należą do Nginx Proxy Managera.
+
+Nazwa obrazu i nazwa kontenera to różne pola. Frontend używa oficjalnego obrazu:
+
+```text
+zabbix/zabbix-web-nginx-mysql:alpine-7.0-latest
+```
+
+i działa jako kontener:
+
+```text
+zabbix-web-nginx
+```
+
+Zabbix działa w katalogu głównym `/`, ponieważ jego frontend nie jest przebudowywany pod niestandardową ścieżkę. Dzięki temu logowanie i ciasteczka sesyjne działają bez dodatkowych modyfikacji obrazu.
 
 ## Wspólna MariaDB
 

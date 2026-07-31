@@ -33,6 +33,7 @@ compose_down /opt/shared-database
 
 docker rm -f \
   path-gateway \
+  zabbix-web-nginx \
   zabbix-web \
   zabbix-server \
   zabbix-db \
