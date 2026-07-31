@@ -102,18 +102,30 @@ existing = next(
 
 certificate_id = 0
 certificate_source = "none"
-existing_certificate_id = int(existing.get("certificate_id", 0)) if existing else 0
+existing_certificate_id = int(existing.get("certificate_id", 0) or 0) if existing else 0
+certificates = []
+managed_certificate = None
 
-# Nie nadpisuj certyfikatu, który administrator podpiął później ręcznie.
-if existing_certificate_id:
-    certificate_id = existing_certificate_id
-    certificate_source = "existing"
-elif SELF_SIGNED_ENABLED:
+if existing_certificate_id or SELF_SIGNED_ENABLED:
     certificates = request("GET", "/nginx/certificates", token=token)
-    certificate = next(
+    managed_certificate = next(
         (item for item in certificates if item.get("nice_name") == SELF_SIGNED_NAME),
         None,
     )
+
+managed_certificate_id = int(managed_certificate["id"]) if managed_certificate else 0
+
+# Zachowaj certyfikat podpięty ręcznie. Gdy wyłączono self-signed, odłącz tylko
+# certyfikat zarządzany wcześniej przez ten projekt.
+if existing_certificate_id:
+    if not SELF_SIGNED_ENABLED and existing_certificate_id == managed_certificate_id:
+        certificate_id = 0
+        certificate_source = "disabled"
+    else:
+        certificate_id = existing_certificate_id
+        certificate_source = "existing"
+elif SELF_SIGNED_ENABLED:
+    certificate = managed_certificate
 
     if certificate is None:
         certificate_files = {
@@ -216,7 +228,7 @@ if existing:
             payload[key] = existing[key]
 
     # Ręcznie dodany certyfikat i ustawienia SSL mają pierwszeństwo.
-    if existing_certificate_id:
+    if existing_certificate_id and certificate_source == "existing":
         for key in (
             "certificate_id",
             "ssl_forced",

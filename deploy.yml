@@ -71,26 +71,6 @@
           security_monitoring_data_root musi być bezwzględną ścieżką inną niż /.
           Przykład: /opt albo /data/security-monitoring.
 
-    - name: Check optional required mountpoint
-      ansible.builtin.command:
-        argv:
-          - findmnt
-          - --mountpoint
-          - "{{ security_monitoring_required_mountpoint }}"
-      register: security_monitoring_mountpoint_check
-      changed_when: false
-      failed_when: false
-      when: security_monitoring_required_mountpoint | default('') | length > 0
-
-    - name: Verify optional required mountpoint
-      ansible.builtin.assert:
-        that:
-          - security_monitoring_mountpoint_check.rc == 0
-        fail_msg: >-
-          Wymagany punkt montowania {{ security_monitoring_required_mountpoint }} nie jest aktywny.
-          Sprawdź findmnt i /etc/fstab przed uruchomieniem kontenerów.
-      when: security_monitoring_required_mountpoint | default('') | length > 0
-
     - name: Resolve deployment directories
       ansible.builtin.set_fact:
         shared_database_directory_effective: >-
@@ -470,6 +450,13 @@
         group: root
         mode: "0755"
 
+    - name: Remove managed default HTTPS virtual host before NPM start when disabled
+      ansible.builtin.file:
+        path: "{{ npm_directory_effective }}/default-host/site.conf"
+        state: absent
+      when: not npm_self_signed_enabled_effective
+      register: npm_default_https_removed
+
     - name: Create Nginx Proxy Manager environment
       ansible.builtin.template:
         src: npm.env.j2
@@ -512,6 +499,32 @@
       retries: 60
       delay: 5
       until: npm_api_check.status in [200, 401]
+
+    - name: Validate Nginx Proxy Manager configuration after disabling managed HTTPS
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - nginx-proxy-manager
+          - nginx
+          - -t
+      changed_when: false
+      when:
+        - not npm_self_signed_enabled_effective
+        - npm_default_https_removed.changed
+
+    - name: Reload Nginx Proxy Manager after disabling managed HTTPS
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - nginx-proxy-manager
+          - nginx
+          - -s
+          - reload
+      when:
+        - not npm_self_signed_enabled_effective
+        - npm_default_https_removed.changed
 
     - name: Create self-signed certificate directory
       ansible.builtin.file:
@@ -592,13 +605,6 @@
         mode: "0644"
       when: npm_self_signed_enabled_effective
       register: npm_default_https_config
-
-    - name: Remove managed default HTTPS virtual host when disabled
-      ansible.builtin.file:
-        path: "{{ npm_directory_effective }}/default-host/site.conf"
-        state: absent
-      when: not npm_self_signed_enabled_effective
-      register: npm_default_https_removed
 
     - name: Validate Nginx Proxy Manager configuration after default HTTPS change
       ansible.builtin.command:

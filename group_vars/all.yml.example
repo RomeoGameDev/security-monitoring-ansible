@@ -6,12 +6,9 @@ disable_conflicting_web_services: true
 
 # Główny katalog wdrożenia i danych aplikacyjnych.
 # Domyślnie zachowuje układ /opt/....
-# Dla osobnego dysku można ustawić np. /data/security-monitoring.
+# Dla osobnego dysku najprościej uruchomić:
+# ./run.sh -d /data/security-monitoring
 security_monitoring_data_root: /opt
-
-# Opcjonalna blokada przed zapisem na partycji systemowej, gdy dysk /data nie jest zamontowany.
-# Dla security_monitoring_data_root: /data/security-monitoring ustaw: /data
-security_monitoring_required_mountpoint: ''
 
 # true: trwałe dane usług są bind-mountami pod powyższą ścieżką.
 # false: dane pozostają w nazwanych wolumenach Dockera pod Docker data-root.
@@ -42,7 +39,7 @@ npm_app_image: jc21/nginx-proxy-manager:2.15.0
 npm_admin_email: admin@example.com
 npm_admin_password: 'changeme'
 
-# Self-signed dla dostępu po IP. HTTPS działa równolegle z HTTP.
+# Self-signed dla dostępu po IP. Można wyłączyć przez: ./run.sh -n
 npm_self_signed_enabled: true
 npm_self_signed_days: 3650
 npm_force_ssl: false
